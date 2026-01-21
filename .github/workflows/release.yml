@@ -32,7 +32,7 @@ jobs:
     uses: STARCK-BRIXTON/actions-create-release/.github/workflows/action.yml@main
 
     with:
-      # Inputs requeridos (del contexto del PR)
+      # Inputs requeridos (del contexto del PR )
       pr_head_ref: ${{ github.event.pull_request.head.ref }}
       pr_title: ${{ github.event.pull_request.title }}
       pr_number: ${{ github.event.pull_request.number }}
@@ -41,9 +41,9 @@ jobs:
       # Inputs opcionales (descomentar para personalizar)
       sync_to_develop: true           # Sincronizar main con develop
       create_changelog: true          # Crear/actualizar CHANGELOG.md
-      # main_branch: 'main'             # Rama principal
+      # Rama principal
       # develop_branch: 'develop'       # Rama develop
       python_version: '3.10'          # Versión de Python
 
     secrets:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.PAT_TOKEN }}
