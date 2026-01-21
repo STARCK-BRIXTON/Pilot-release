@@ -1,8 +1,7 @@
 # Ejemplo de workflow para usar en repositorios consumidores
 # Copia este archivo a .github/workflows/release.yml en tu repositorio
 #
-# IMPORTANTE: Reemplaza 'TU-ORG/github-actions-release' con la ruta real
-# del repositorio donde alojaste la action.
+
 
 name: Release Automático
 
@@ -26,7 +25,7 @@ jobs:
       )
 
     # Llamar al reusable workflow
-    uses: TU-ORG/github-actions-release/.github/workflows/release-workflow.yml@v1
+    uses: STARCK-BRIXTON/github-actions-release/.github/workflows/action.yml@main
 
     with:
       # Inputs requeridos (del contexto del PR)
