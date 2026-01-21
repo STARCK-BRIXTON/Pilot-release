@@ -1,0 +1,46 @@
+# Ejemplo de workflow para usar en repositorios consumidores
+# Copia este archivo a .github/workflows/release.yml en tu repositorio
+#
+# IMPORTANTE: Reemplaza 'TU-ORG/github-actions-release' con la ruta real
+# del repositorio donde alojaste la action.
+
+name: Release Automático
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main
+
+jobs:
+  release:
+    # Solo ejecutar cuando:
+    # 1. El PR fue mergeado (no solo cerrado)
+    # 2. La rama origen es hotfix/* o release/*
+    if: >-
+      github.event.pull_request.merged == true &&
+      (
+        startsWith(github.event.pull_request.head.ref, 'hotfix') ||
+        startsWith(github.event.pull_request.head.ref, 'release')
+      )
+
+    # Llamar al reusable workflow
+    uses: TU-ORG/github-actions-release/.github/workflows/release-workflow.yml@v1
+
+    with:
+      # Inputs requeridos (del contexto del PR)
+      pr_head_ref: ${{ github.event.pull_request.head.ref }}
+      pr_title: ${{ github.event.pull_request.title }}
+      pr_number: ${{ github.event.pull_request.number }}
+      pr_body: ${{ github.event.pull_request.body }}
+
+      # Inputs opcionales (descomentar para personalizar)
+      sync_to_develop: true           # Sincronizar main con develop
+      create_changelog: true          # Crear/actualizar CHANGELOG.md
+      # main_branch: 'main'             # Rama principal
+      # develop_branch: 'develop'       # Rama develop
+      python_version: '3.10'          # Versión de Python
+
+    secrets:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
