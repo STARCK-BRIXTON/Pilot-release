@@ -12,6 +12,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+  security-events: write
 jobs:
   release:
     # Solo ejecutar cuando:
@@ -25,7 +28,7 @@ jobs:
       )
 
     # Llamar al reusable workflow
-    uses: STARCK-BRIXTON/github-actions-release/.github/workflows/action.yml@main
+    uses: STARCK-BRIXTON/actions-create-release/.github/workflows/action.yml@main
 
     with:
       # Inputs requeridos (del contexto del PR)
