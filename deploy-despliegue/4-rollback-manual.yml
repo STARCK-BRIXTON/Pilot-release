@@ -1,0 +1,486 @@
+# ================================================================
+# .github/workflows/rollback-manual.yml
+# ================================================================
+# WORKFLOW 4 / 4
+#
+# RESPONSABILIDAD ÚNICA: Rollback manual a producción.
+#
+# Este workflow es COMPLETAMENTE INDEPENDIENTE de los otros tres.
+# No comparte estado, no depende de outputs de otros workflows.
+# Puede ejecutarse en cualquier momento por cualquier persona
+# con permisos al environment "production".
+#
+# CUÁNDO usarlo:
+#   - El rollback automático de deploy-production.yml falló
+#   - Se detectó un bug post-deploy y se necesita revertir
+#   - Intervención de emergencia fuera de horario
+#   - Cualquier situación que requiera volver a una versión conocida
+#
+# CÓMO dispararlo:
+#   GitHub → Actions → "Manual Rollback - Production" → Run workflow
+#   → Introducir tag destino + motivo + confirmación → Aprobar (environment)
+#
+# TRES CAPAS DE PROTECCIÓN:
+#   1. Confirmación textual obligatoria ("CONFIRMO ROLLBACK")
+#   2. Validaciones automáticas (formato, existencia, comparación)
+#   3. Aprobación obligatoria del environment "production"
+#
+# COMUNICACIÓN CON OTROS WORKFLOWS:
+#   ← Lee .deploy/current-production.json (escrito por deploy-production)
+#   → Escribe .deploy/current-production.json tras rollback exitoso
+# ================================================================
+
+name: "Manual Rollback - Production"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_destino:
+        description: |
+          Tag al que hacer rollback. Debe existir en el repo.
+          Ejemplo: v2.3.1
+        required: true
+        type: string
+
+      motivo:
+        description: |
+          Motivo del rollback (se guarda en audit trail).
+          Ejemplo: "Bug crítico en v2.4.0 que afecta checkout"
+        required: true
+        type: string
+
+      confirmacion:
+        description: |
+          Escribir exactamente "CONFIRMO ROLLBACK" para proceder.
+          Este campo existe para evitar ejecuciones accidentales.
+        required: true
+        type: string
+
+permissions:
+  contents: write      # Para escribir current-production.json
+  issues: write        # Para crear issues de notificación
+  deployments: write   # Para registrar el deployment
+
+# ================================================================
+# JOB 1: VALIDACIÓN
+# ================================================================
+# Corre en github-hosted. Todas las validaciones se resuelven
+# ANTES de que el runner self-hosted se involucre.
+# Si cualquier validación falla, el workflow muere aquí.
+# ================================================================
+jobs:
+  validar:
+    name: "Validaciones pre-rollback"
+    runs-on: ubuntu-latest
+
+    outputs:
+      tag_validado: ${{ steps.validar-tag.outputs.tag_validado }}
+      tag_actual_produccion: ${{ steps.obtener-version-actual.outputs.tag_actual }}
+
+    steps:
+      # ─── CAPA 1: Verificar confirmación textual ──────────
+      # El primer filtro. Si el usuario no escribió exactamente
+      # "CONFIRMO ROLLBACK", el workflow muere aquí.
+      # Un checkbox booleano no es suficiente protección contra
+      # ejecuciones accidentales. Un campo de texto que debe
+      # coincidir exactamente sí lo es.
+      - name: "Verificar confirmación"
+        run: |
+          CONFIRMACION="${{ github.event.inputs.confirmacion }}"
+          if [ "${CONFIRMACION}" != "CONFIRMO ROLLBACK" ]; then
+            echo "❌ Confirmación inválida."
+            echo "   Escribió:    '${CONFIRMACION}'"
+            echo "   Se esperaba: 'CONFIRMO ROLLBACK'"
+            echo ""
+            echo "   El workflow no se ejecutará. Esto es por diseño."
+            exit 1
+          fi
+          echo "✅ Confirmación válida."
+
+      # ─── Checkout con historial completo ───────────────────
+      # fetch-depth: 0 es obligatorio. Sin el historial completo
+      # no puede ver otros tags para la comparación de versiones.
+      - name: "Checkout con historial completo"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ─── CAPA 2A: Validar formato del tag ─────────────────
+      # Regex estricto: v + tres enteros separados por punto.
+      # v2.4.0 ✅ | v2.4 ❌ | 2.4.0 ❌ | v2.4.0-rc1 ❌
+      - name: "Validar formato del tag"
+        run: |
+          TAG="${{ github.event.inputs.tag_destino }}"
+          if echo "${TAG}" | grep -qP '^v\d+\.\d+\.\d+$'; then
+            echo "✅ Formato válido: ${TAG}"
+          else
+            echo "❌ Formato de tag inválido: '${TAG}'"
+            echo "   Formato requerido: vX.Y.Z"
+            echo "   Ejemplos válidos:   v1.0.0 | v2.3.1 | v10.0.5"
+            echo "   Ejemplos inválidos: v2.4 | 2.4.0 | v2.4.0-beta"
+            exit 1
+          fi
+
+      # ─── CAPA 2B: Verificar que el tag existe en git ──────
+      # Si no existe, muestra los últimos 10 tags disponibles
+      # para ayudar al operador a elegir uno válido.
+      - name: "Verificar existencia del tag en el repositorio"
+        id: validar-tag
+        run: |
+          TAG="${{ github.event.inputs.tag_destino }}"
+
+          if git rev-parse --verify "refs/tags/${TAG}" > /dev/null 2>&1; then
+            COMMIT_SHA=$(git rev-parse "refs/tags/${TAG}")
+            echo "✅ Tag existe."
+            echo "   Tag:    ${TAG}"
+            echo "   Commit: ${COMMIT_SHA}"
+            echo "tag_validado=${TAG}" >> $GITHUB_OUTPUT
+          else
+            echo "❌ El tag '${TAG}' NO existe en el repositorio."
+            echo ""
+            echo "Tags disponibles (últimos 10):"
+            git tag --sort=-version:refname | grep -P '^v\d+\.\d+\.\d+$' | head -10
+            exit 1
+          fi
+
+      # ─── CAPA 2C: Obtener versión actual en producción ────
+      # Lee el archivo que deploy-production.yml escribe tras
+      # cada deploy exitoso. Es la fuente de verdad compartida.
+      #
+      # Si el archivo no existe (ej: primera vez, o nunca se
+      # completó un deploy exitoso), permite continuar con warning.
+      # El environment approval será el último filtro de seguridad.
+      - name: "Obtener versión actual en producción"
+        id: obtener-version-actual
+        run: |
+          CURRENT_FILE=".deploy/current-production.json"
+
+          if [ -f "${CURRENT_FILE}" ]; then
+            TAG_ACTUAL=$(python3 -c "import json; print(json.load(open('${CURRENT_FILE}'))['tag'])")
+            echo "✅ Versión actual en producción: ${TAG_ACTUAL}"
+            echo "tag_actual=${TAG_ACTUAL}" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️  Archivo ${CURRENT_FILE} no encontrado."
+            echo "    No se puede verificar la versión actual."
+            echo "    La aprobación del environment será el filtro de seguridad."
+            echo "tag_actual=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      # ─── CAPA 2D: Comparar versiones ──────────────────────
+      # Dos verificaciones:
+      #   A) El tag destino no es el mismo que el actual (no tiene sentido)
+      #   B) El tag destino es menor que el actual (es un rollback real,
+      #      no un forward deploy disfrazado)
+      #
+      # Comparación numérica usando pesos:
+      #   Major × 1,000,000 + Minor × 1,000 + Patch
+      #   Esto permite comparar cualquier combinación correctamente.
+      - name: "Comparar versiones y validar que es rollback legítimo"
+        id: comparar-versiones
+        run: |
+          TAG_DESTINO="${{ github.event.inputs.tag_destino }}"
+          TAG_ACTUAL="${{ steps.obtener-version-actual.outputs.tag_actual }}"
+
+          # Si no conocemos la versión actual, no podemos comparar
+          if [ "${TAG_ACTUAL}" = "unknown" ]; then
+            echo "⚠️  No se puede comparar versiones (actual desconocida)."
+            echo "    La aprobación del environment será el filtro."
+            exit 0
+          fi
+
+          # Verificación A: No ser la misma versión
+          if [ "${TAG_DESTINO}" = "${TAG_ACTUAL}" ]; then
+            echo "❌ El tag destino (${TAG_DESTINO}) es IGUAL al actual en producción."
+            echo "   No tiene sentido hacer rollback a la misma versión."
+            exit 1
+          fi
+
+          # Verificación B: Comparar numéricamente
+          parse_version() {
+            echo "$1" | sed 's/^v//' | awk -F. '{print $1, $2, $3}'
+          }
+
+          read DEST_MAJOR DEST_MINOR DEST_PATCH <<< $(parse_version "${TAG_DESTINO}")
+          read CURR_MAJOR CURR_MINOR CURR_PATCH <<< $(parse_version "${TAG_ACTUAL}")
+
+          DEST_NUM=$(( DEST_MAJOR * 1000000 + DEST_MINOR * 1000 + DEST_PATCH ))
+          CURR_NUM=$(( CURR_MAJOR * 1000000 + CURR_MINOR * 1000 + CURR_PATCH ))
+
+          if [ "${DEST_NUM}" -lt "${CURR_NUM}" ]; then
+            echo "✅ Rollback legítimo confirmado."
+            echo "   Actual:  ${TAG_ACTUAL} (peso: ${CURR_NUM})"
+            echo "   Destino: ${TAG_DESTINO} (peso: ${DEST_NUM})"
+          else
+            echo "❌ El tag destino (${TAG_DESTINO}) NO es menor que el actual (${TAG_ACTUAL})."
+            echo "   Este workflow es para ROLLBACK, no para forward deploy."
+            echo "   Si necesitas desplegar una versión mayor, usa deploy-production.yml"
+            exit 1
+          fi
+
+      # ─── Resumen visual antes de la aprobación ────────────
+      # El reviewer que aprueba en el environment ve este resumen.
+      # Es la última línea de defensa antes de que algo se ejecute
+      # en producción.
+      - name: "Resumen de validaciones"
+        run: |
+          echo "=============================================="
+          echo "  RESUMEN PRE-ROLLBACK"
+          echo "=============================================="
+          echo "  Tag destino:      ${{ github.event.inputs.tag_destino }}"
+          echo "  Versión actual:   ${{ steps.obtener-version-actual.outputs.tag_actual }}"
+          echo "  Motivo:           ${{ github.event.inputs.motivo }}"
+          echo "  Ejecutado por:    ${{ github.actor }}"
+          echo "  Timestamp:        $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "=============================================="
+          echo ""
+          echo "  ✅ Confirmación textual:  OK"
+          echo "  ✅ Formato del tag:       OK"
+          echo "  ✅ Tag existe en git:     OK"
+          echo "  ✅ Versión comparada:     OK"
+          echo "=============================================="
+          echo ""
+          echo "  → Siguiente paso: Aprobación en environment 'production'"
+
+  # ================================================================
+  # JOB 2: EJECUTAR ROLLBACK
+  # ================================================================
+  # El único job que corre en self-hosted.
+  # Solo se ejecuta si todas las validaciones pasaron.
+  #
+  # CAPA 3: environment: production activa la aprobación obligatoria.
+  # El workflow se PAUSA aquí hasta que alguien del equipo apruebe
+  # desde la UI de GitHub. El self-hosted runner aún no está ocupado.
+  # ================================================================
+  ejecutar-rollback:
+    name: "Ejecutar rollback en producción"
+    needs: validar
+    runs-on: self-hosted
+    environment: production   # ← PAUSA hasta aprobación (CAPA 3)
+    timeout-minutes: 30
+
+    steps:
+      # ─── Clean workspace ──────────────────────────────────
+      # Obligatorio en self-hosted. Sin esto, estado de
+      # ejecuciones anteriores puede contaminar el rollback.
+      - name: "Limpiar workspace del runner"
+        run: |
+          rm -rf ${GITHUB_WORKSPACE}/*
+          rm -rf ${GITHUB_WORKSPACE}/.git
+          echo "✅ Workspace limpio."
+
+      # ─── Checkout exacto del tag destino ───────────────────
+      # ref apunta exactamente al tag → detached HEAD.
+      # Determinista: siempre el mismo código para el mismo tag.
+      - name: "Checkout del tag destino"
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag_destino }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ─── Verificar checkout ───────────────────────────────
+      # En rollback manual, un error de checkout puede desplegar
+      # la versión incorrecta. Verificar siempre.
+      - name: "Verificar integridad del checkout"
+        run: |
+          TAG_ESPERADO="${{ github.event.inputs.tag_destino }}"
+          TAG_ACTUAL=$(git describe --exact-match --tags HEAD 2>/dev/null || echo "NONE")
+
+          if [ "${TAG_ACTUAL}" != "${TAG_ESPERADO}" ]; then
+            echo "❌ ERROR CRÍTICO: Esperado ${TAG_ESPERADO}, actual ${TAG_ACTUAL}"
+            echo "   Abortando rollback."
+            exit 1
+          fi
+          echo "✅ Checkout verificado: ${TAG_ACTUAL} (SHA: $(git rev-parse HEAD))"
+
+      # ─── Build ────────────────────────────────────────────
+      # DEBE ser exactamente el mismo mecanismo de build que usa
+      # deploy-production.yml. Consistencia es crítica.
+      - name: "Build de la versión de rollback"
+        run: |
+          TAG="${{ github.event.inputs.tag_destino }}"
+          echo "🔨 Building versión ${TAG} para rollback..."
+          # ═══ MISMO BUILD QUE EN deploy-production.yml ═══
+          echo "✅ Build completado."
+
+      # ─── Deploy ───────────────────────────────────────────
+      # DEBE ser exactamente el mismo mecanismo de deploy que usa
+      # deploy-production.yml. Si uno usa docker-compose, este
+      # debe usar docker-compose.
+      - name: "Ejecutar deploy de rollback"
+        run: |
+          TAG="${{ github.event.inputs.tag_destino }}"
+          echo "=============================================="
+          echo "  INICIANDO ROLLBACK A PRODUCCIÓN"
+          echo "  Tag destino: ${TAG}"
+          echo "  Momento:     $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "=============================================="
+
+          # ═══ MISMO DEPLOY QUE EN deploy-production.yml ═══
+          # Docker Compose:
+          #   export IMAGE_TAG=${TAG}
+          #   docker-compose -f docker-compose.prod.yml up -d --force-recreate
+          #
+          # Kubernetes:
+          #   kubectl set image deployment/myapp myapp=registry/myapp:${TAG}
+          #   kubectl rollout status deployment/myapp --timeout=300s
+          # ═════════════════════════════════════════════════
+
+          echo "✅ Deploy de rollback ejecutado."
+
+      # ─── Health Check ─────────────────────────────────────
+      # El rollback no es "exitoso" hasta que la app responde.
+      # Si falla, el job falla y la notificación marca como CRÍTICO.
+      - name: "Health check post-rollback"
+        run: |
+          HEALTH_URL="${{ secrets.DEPLOY_HEALTH_CHECK_URL }}"
+          TAG="${{ github.event.inputs.tag_destino }}"
+          MAX_REINTENTOS=10
+          ESPERA=15
+
+          echo "🏥 Health check para rollback (${TAG})..."
+
+          for i in $(seq 1 ${MAX_REINTENTOS}); do
+            echo "  Intento ${i}/${MAX_REINTENTOS}..."
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${HEALTH_URL}" 2>/dev/null || echo "000")
+            echo "  HTTP: ${HTTP_CODE}"
+
+            if [ "${HTTP_CODE}" = "200" ]; then
+              echo "✅ Health check exitoso. Rollback completado: ${TAG} está activo."
+              exit 0
+            fi
+
+            [ "${i}" -lt "${MAX_REINTENTOS}" ] && sleep ${ESPERA}
+          done
+
+          echo "🚨 CRÍTICO: Health check del rollback manual también falló."
+          echo "   Se requiere intervención manual inmediata en el servidor."
+          exit 1
+
+      # ─── Actualizar registro de versión activa ────────────
+      # Solo se ejecuta si el health check pasó.
+      # Mantiene la fuente de verdad en sync para que el próximo
+      # rollback-manual (u otro workflow) sepa qué versión está activa.
+      - name: "Actualizar .deploy/current-production.json"
+        run: |
+          TAG="${{ github.event.inputs.tag_destino }}"
+
+          python3 << PYEOF
+import json
+from datetime import datetime, timezone
+
+data = {
+    "tag": "${TAG}",
+    "deployed_at": datetime.now(timezone.utc).isoformat(),
+    "deployed_by": "${{ github.actor }}",
+    "method": "manual-rollback",
+    "workflow_run_id": "${{ github.run_id }}",
+    "motivo": "${{ github.event.inputs.motivo }}"
+}
+
+with open(".deploy/current-production.json", "w") as f:
+    json.dump(data, f, indent=2)
+
+print(json.dumps(data, indent=2))
+PYEOF
+
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "GitHub Actions Bot"
+          git add .deploy/current-production.json
+          git commit -m "chore: rollback producción a ${TAG} - ${{ github.event.inputs.motivo }} [no-release]" || true
+          git push origin main || true
+
+  # ================================================================
+  # JOB 3: NOTIFICACIÓN
+  # ================================================================
+  # Siempre corre (if: always()). Cubre todos los estados:
+  #   - Abortado en validación (sin cambios en producción)
+  #   - Rollback exitoso
+  #   - Rollback falló (CRÍTICO)
+  # ================================================================
+  notificar:
+    name: "Notificación del resultado"
+    needs: [validar, ejecutar-rollback]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Crear issue de notificación"
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const validarResult  = '${{ needs.validar.result }}';
+            const rollbackResult = '${{ needs.ejecutar-rollback.result }}';
+            const tagDestino     = '${{ github.event.inputs.tag_destino }}';
+            const motivo         = '${{ github.event.inputs.motivo }}';
+            const actor          = '${{ github.actor }}';
+            const runUrl         = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
+
+            let title, body, labels;
+
+            if (validarResult === 'failure') {
+              // ── Abortado en validación: ningún cambio en producción ──
+              title  = `❌ Rollback manual ABORTADO en validación: ${tagDestino}`;
+              body   = `El rollback fue abortado porque no pasó las validaciones.\n\n` +
+                       `**No se realizó ningún cambio en producción.**\n\n` +
+                       `| Campo | Valor |\n|---|---|\n` +
+                       `| **Tag destino** | \`${tagDestino}\` |\n` +
+                       `| **Motivo** | ${motivo} |\n` +
+                       `| **Ejecutado por** | @${actor} |\n` +
+                       `| **Workflow run** | [Ver logs](${runUrl}) |\n`;
+              labels = ['rollback-manual', 'abortado'];
+
+            } else if (rollbackResult === 'success') {
+              // ── Rollback exitoso ──
+              title  = `✅ Rollback manual exitoso: producción ahora en ${tagDestino}`;
+              body   = `El rollback manual fue completado exitosamente.\n\n` +
+                       `| Campo | Valor |\n|---|---|\n` +
+                       `| **Versión activa** | \`${tagDestino}\` |\n` +
+                       `| **Motivo** | ${motivo} |\n` +
+                       `| **Ejecutado por** | @${actor} |\n` +
+                       `| **Momento** | ${new Date().toISOString()} |\n` +
+                       `| **Workflow run** | [Ver logs](${runUrl}) |\n\n` +
+                       `### Próximos pasos\n` +
+                       `- [ ] Investigar el problema que causó el rollback\n` +
+                       `- [ ] Crear PR de fix\n` +
+                       `- [ ] Re-desplegar cuando esté listo\n`;
+              labels = ['rollback-manual', 'exitoso'];
+
+            } else if (rollbackResult === 'failure') {
+              // ── Rollback falló: estado CRÍTICO ──
+              title  = `🚨 CRÍTICO: Rollback manual FALLÓ: ${tagDestino}`;
+              body   = `⚠️ **Se requiere intervención manual inmediata.**\n\n` +
+                       `El rollback manual a \`${tagDestino}\` falló.\n` +
+                       `El estado de producción puede estar inconsistente.\n\n` +
+                       `| Campo | Valor |\n|---|---|\n` +
+                       `| **Tag destino** | \`${tagDestino}\` |\n` +
+                       `| **Motivo original** | ${motivo} |\n` +
+                       `| **Ejecutado por** | @${actor} |\n` +
+                       `| **Workflow run** | [Ver logs](${runUrl}) |\n\n` +
+                       `### Acciones requeridas inmediatamente\n` +
+                       `- [ ] Revisar los logs del workflow (link arriba)\n` +
+                       `- [ ] Verificar el estado de producción manualmente\n` +
+                       `- [ ] Contactar al equipo de infraestructura\n` +
+                       `- [ ] Considerar rollback directo en el servidor (bypass de GitHub Actions)\n`;
+              labels = ['rollback-manual', 'CRÍTICO'];
+
+            } else {
+              // ── Estado inesperado (skipped, cancelled, etc.) ──
+              title  = `⚠️ Rollback manual estado inesperado: ${tagDestino}`;
+              body   = `El rollback resultó en un estado inesperado: \`${rollbackResult}\`\n\n` +
+                       `**Revisar manualmente.**\n\n` +
+                       `[Ver logs](${runUrl})`;
+              labels = ['rollback-manual', 'requiere-revision'];
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: labels
+            });
+
+            console.log('Issue creado: ' + title);

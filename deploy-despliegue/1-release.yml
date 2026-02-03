@@ -1,0 +1,175 @@
+# ================================================================
+# .github/workflows/release.yml
+# ================================================================
+# WORKFLOW 1 / 4
+#
+# RESPONSABILIDAD ÚNICA: Crear tag semántico tras merge a main.
+# Nada más. No deploya, no notifica.
+#
+# TRIGGERS:
+#   push → main
+#
+# RUNNER: github-hosted
+#   No necesita acceso a infraestructura. Solo opera con git y
+#   la API de GitHub.
+#
+# COMUNICACIÓN CON OTROS WORKFLOWS:
+#   → Crea el tag vX.Y.Z (lo lee deploy-schedule para validar)
+#   → Crea .github/deploy-schedule/vX.Y.Z.json (lo lee deploy-schedule para saber cuándo desplegar)
+#
+# CONDICIÓN DE ENTRADA:
+#   El mensaje del commit de merge debe contener [release].
+#   Sin esto, cualquier push a main (incluyendo commits directos)
+#   dispararía la creación de un tag.
+# ================================================================
+
+name: "Release - Create Semantic Tag"
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write   # Para crear tags y el archivo de schedule
+
+jobs:
+  create-tag:
+    runs-on: ubuntu-latest
+
+    # Solo correr si el commit tiene la marca [release].
+    # Sin esto, CUALQUIER push a main crearía un tag.
+    if: >
+      contains(github.event.head_commit.message, '[release]')
+
+    steps:
+      # ─── Checkout con historial completo ──────────────────────
+      # fetch-depth: 0 es CRÍTICO. Sin esto GitHub Actions hace un
+      # shallow clone y no puede ver tags anteriores para calcular
+      # la siguiente versión.
+      - name: "Checkout con historial completo"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ─── Obtener la última versión existente ──────────────────
+      # git describe busca el tag más cercano en el historial.
+      # Si no existe ningún tag, usamos v0.0.0 como base.
+      - name: "Obtener última versión"
+        id: get-version
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "last_tag=${LAST_TAG}" >> $GITHUB_OUTPUT
+
+          VERSION_CLEAN=$(echo "${LAST_TAG}" | sed 's/^v//')
+          MAJOR=$(echo "${VERSION_CLEAN}" | cut -d. -f1)
+          MINOR=$(echo "${VERSION_CLEAN}" | cut -d. -f2)
+          PATCH=$(echo "${VERSION_CLEAN}" | cut -d. -f3)
+
+          echo "major=${MAJOR}" >> $GITHUB_OUTPUT
+          echo "minor=${MINOR}" >> $GITHUB_OUTPUT
+          echo "patch=${PATCH}" >> $GITHUB_OUTPUT
+
+      # ─── Calcular el nuevo tag ────────────────────────────────
+      # Lee los labels del PR desde el mensaje de merge.
+      # Formato esperado en el PR: incluir [major], [minor], o [patch]
+      # Si no tiene ninguno → default patch (más seguro)
+      - name: "Calcular nuevo tag"
+        id: calc-tag
+        run: |
+          MAJOR=${{ steps.get-version.outputs.major }}
+          MINOR=${{ steps.get-version.outputs.minor }}
+          PATCH=${{ steps.get-version.outputs.patch }}
+          COMMIT_MSG="${{ github.event.head_commit.message }}"
+
+          # Lógica de bump. El orden importa: major > minor > patch
+          if echo "${COMMIT_MSG}" | grep -qi "\[major\]"; then
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+            BUMP_TYPE="major"
+          elif echo "${COMMIT_MSG}" | grep -qi "\[minor\]"; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+            BUMP_TYPE="minor"
+          else
+            PATCH=$((PATCH + 1))
+            BUMP_TYPE="patch"
+          fi
+
+          NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "new_tag=${NEW_TAG}" >> $GITHUB_OUTPUT
+          echo "bump_type=${BUMP_TYPE}" >> $GITHUB_OUTPUT
+
+      # ─── Crear el tag anotado ─────────────────────────────────
+      # Tags anotados: almacenan metadata (quién, cuándo, mensaje).
+      # git describe los prefiere. Estándar de industria para releases.
+      - name: "Crear tag anotado en GitHub"
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.calc-tag.outputs.new_tag }}
+          name: "Release ${{ steps.calc-tag.outputs.new_tag }}"
+          body: |
+            **Tipo de cambio:** ${{ steps.calc-tag.outputs.bump_type }}
+            **Versión anterior:** ${{ steps.get-version.outputs.last_tag }}
+            **Creado desde:** merge a main
+          draft: false
+          prerelease: false
+
+      # ─── Extraer fecha de deploy ──────────────────────────────
+      # El developer debe haber incluido en el PR:
+      #   DEPLOY_SCHEDULED: 2026-02-10T22:00:00+01:00
+      # Se valida que sea ISO 8601 válido y se convierte a UTC epoch.
+      - name: "Extraer fecha de deploy del mensaje del PR"
+        id: extract-date
+        run: |
+          COMMIT_MSG="${{ github.event.head_commit.message }}"
+          SCHEDULED_DATE=$(echo "${COMMIT_MSG}" | grep -oP 'DEPLOY_SCHEDULED:\s*\K[^\s]+' || echo "")
+
+          if [ -z "${SCHEDULED_DATE}" ]; then
+            echo "ERROR: No se encontró DEPLOY_SCHEDULED en el mensaje del commit."
+            echo "Formato requerido: DEPLOY_SCHEDULED: 2026-02-10T22:00:00+01:00"
+            exit 1
+          fi
+
+          # Validar formato ISO 8601
+          if ! date --date="${SCHEDULED_DATE}" +%s > /dev/null 2>&1; then
+            echo "ERROR: Fecha inválida: ${SCHEDULED_DATE}"
+            echo "Use formato ISO 8601: YYYY-MM-DDTHH:MM:SS+HH:MM"
+            exit 1
+          fi
+
+          # Convertir a UTC epoch para comparaciones consistentes
+          EPOCH=$(date --date="${SCHEDULED_DATE}" +%s)
+          echo "scheduled_date=${SCHEDULED_DATE}" >> $GITHUB_OUTPUT
+          echo "scheduled_epoch=${EPOCH}" >> $GITHUB_OUTPUT
+
+      # ─── Crear archivo de schedule ────────────────────────────
+      # Actúa como "ticket de trabajo" para el cron de deploy-schedule.
+      # Comunicación explícita entre workflows usando archivos en el repo.
+      - name: "Crear archivo de schedule en el repo"
+        run: |
+          TAG=${{ steps.calc-tag.outputs.new_tag }}
+          EPOCH=${{ steps.extract-date.outputs.scheduled_epoch }}
+          DATE=${{ steps.extract-date.outputs.scheduled_date }}
+
+          mkdir -p .github/deploy-schedule
+
+          cat > .github/deploy-schedule/${TAG}.json << EOF
+          {
+            "tag": "${TAG}",
+            "scheduled_date_original": "${DATE}",
+            "scheduled_epoch_utc": ${EPOCH},
+            "status": "pending",
+            "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "GitHub Actions Bot"
+          git add .github/deploy-schedule/${TAG}.json
+          git commit -m "chore: schedule deploy for ${TAG} at ${DATE} [no-release]"
+          git push origin main

@@ -1,0 +1,196 @@
+# ================================================================
+# .github/workflows/deploy-schedule.yml
+# ================================================================
+# WORKFLOW 2 / 4
+#
+# RESPONSABILIDAD ÚNICA: Vigilar si es momento de desplegar.
+# Es el "reloj" del sistema. No hace deploy él mismo.
+#
+# TRIGGERS:
+#   schedule → cron cada 5 minutos
+#   workflow_dispatch → fallback manual de emergencia
+#
+# RUNNER: github-hosted
+#   Solo lee estado del repo y llama a la API de GitHub.
+#   No necesita acceso a infraestructura on-premise.
+#
+# COMUNICACIÓN CON OTROS WORKFLOWS:
+#   ← Lee .github/deploy-schedule/vX.Y.Z.json (creado por release.yml)
+#   → Dispara deploy-production.yml via GitHub API (workflow_dispatch)
+#
+# POR QUÉ CADA 5 MINUTOS Y NO CADA SEGUNDO:
+#   GitHub Actions tiene límites de ejecución (minutos/mes).
+#   5 minutos de tolerancia es aceptable para deploys programados
+#   en producción. Si necesitas precisión al segundo, usa un
+#   sistema externo (CloudWatch Events, Pub/Sub, etc.)
+# ================================================================
+
+name: "Deploy Schedule - Monitor & Trigger"
+
+on:
+  schedule:
+    # Cada 5 minutos. GitHub no garantiza exactitud al segundo,
+    # es aproximado. Esto es aceptable para este uso caso.
+    - cron: '*/5 * * * *'
+
+  # Fallback manual para emergencias.
+  # Permite desplegar un tag específico sin esperar al cron.
+  workflow_dispatch:
+    inputs:
+      force_tag:
+        description: 'Forzar deploy de un tag específico (ej: v2.4.0). Deja vacío para modo cron normal.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: write   # Para poder llamar a otro workflow via API
+
+jobs:
+  check-schedule:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Checkout del repo"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ─── CASO 1: Dispatch manual con tag forzado ────────────
+      # Un admin puede desplegar un tag específico sin esperar
+      # al cron. Útil en emergencias.
+      - name: "Manejar dispatch manual"
+        id: check-manual
+        run: |
+          FORCE_TAG="${{ github.event.inputs.force_tag }}"
+          if [ -n "${FORCE_TAG}" ]; then
+            echo "manual_trigger=true" >> $GITHUB_OUTPUT
+            echo "target_tag=${FORCE_TAG}" >> $GITHUB_OUTPUT
+            echo "Modo: dispatch manual con tag ${FORCE_TAG}"
+          else
+            echo "manual_trigger=false" >> $GITHUB_OUTPUT
+            echo "Modo: cron automático"
+          fi
+
+      # ─── CASO 2: Cron automático ─────────────────────────────
+      # Escanea los archivos JSON de schedule y compara la hora
+      # actual con la hora programada.
+      - name: "Escanear schedules pendientes"
+        id: scan-schedule
+        if: steps.check-manual.outputs.manual_trigger == 'false'
+        run: |
+          CURRENT_EPOCH=$(date +%s)
+          TARGET_TAG=""
+
+          # Recorrer todos los archivos JSON de schedule
+          for file in .github/deploy-schedule/*.json; do
+            # Verificar que el archivo existe (glob puede retornar literal si no hay matches)
+            [ -f "$file" ] || continue
+
+            STATUS=$(python3 -c "import json; print(json.load(open('$file'))['status'])")
+            SCHEDULED_EPOCH=$(python3 -c "import json; print(json.load(open('$file'))['scheduled_epoch_utc'])")
+            TAG=$(python3 -c "import json; print(json.load(open('$file'))['tag'])")
+
+            # Solo procesar los que están en "pending"
+            if [ "${STATUS}" = "pending" ] && [ "${CURRENT_EPOCH}" -ge "${SCHEDULED_EPOCH}" ]; then
+              TARGET_TAG="${TAG}"
+              echo "✅ Encontrado schedule pendiente cuya hora ya pasó: ${TAG}"
+              # Si hay varios pendientes, tomar el más antiguo (FIFO).
+              # En la práctica no debería haber más de uno pending.
+              break
+            fi
+          done
+
+          if [ -n "${TARGET_TAG}" ]; then
+            echo "found_target=true" >> $GITHUB_OUTPUT
+            echo "target_tag=${TARGET_TAG}" >> $GITHUB_OUTPUT
+          else
+            echo "found_target=false" >> $GITHUB_OUTPUT
+            echo "No hay schedules pendientes cuya hora ya haya pasado. Saliendo."
+          fi
+
+      # ─── VALIDACIÓN: Verificar que el tag existe en git ─────
+      # Previene el Race Condition entre merge y creación de tag.
+      # Si el tag aún no existe (latencia), no dispara y el cron
+      # reintenta en 5 minutos.
+      - name: "Validar existencia del tag en git"
+        id: validate-tag
+        if: >
+          steps.check-manual.outputs.manual_trigger == 'true' ||
+          steps.scan-schedule.outputs.found_target == 'true'
+        run: |
+          # Determinar qué tag usar según el modo
+          if [ "${{ steps.check-manual.outputs.manual_trigger }}" = "true" ]; then
+            TAG="${{ steps.check-manual.outputs.target_tag }}"
+          else
+            TAG="${{ steps.scan-schedule.outputs.target_tag }}"
+          fi
+
+          # Verificar existencia del tag
+          if git rev-parse --verify "refs/tags/${TAG}" > /dev/null 2>&1; then
+            echo "✅ Tag ${TAG} existe en el repo."
+            echo "tag_exists=true" >> $GITHUB_OUTPUT
+            echo "validated_tag=${TAG}" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️  Tag ${TAG} NO existe aún en el repo."
+            echo "    Puede ser un timing issue entre merge y creación de tag."
+            echo "    El cron reintentará en ~5 minutos."
+            echo "tag_exists=false" >> $GITHUB_OUTPUT
+            # exit 0: no fallar el workflow. El cron simplemente no dispara esta vez.
+            exit 0
+          fi
+
+      # ─── DISPARAR: Llamar al workflow de deploy ──────────────
+      # Dispara deploy-production.yml via la API de GitHub.
+      # Esto permite pasar inputs (tag) al workflow llamado.
+      - name: "Disparar deploy a producción"
+        if: steps.validate-tag.outputs.tag_exists == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatchEventForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'deploy-production.yml',
+              ref: 'main',
+              inputs: {
+                tag: '${{ steps.validate-tag.outputs.validated_tag }}',
+                triggered_by: 'schedule'
+              }
+            });
+            console.log('✅ deploy-production.yml disparado para tag: ${{ steps.validate-tag.outputs.validated_tag }}');
+
+      # ─── ACTUALIZAR: Marcar el schedule como "triggered" ─────
+      # Para que el cron no lo dispare de nuevo en la siguiente
+      # iteración de los 5 minutos.
+      - name: "Actualizar estado del schedule a triggered"
+        if: steps.validate-tag.outputs.tag_exists == 'true'
+        run: |
+          TAG="${{ steps.validate-tag.outputs.validated_tag }}"
+          SCHEDULE_FILE=".github/deploy-schedule/${TAG}.json"
+
+          if [ -f "${SCHEDULE_FILE}" ]; then
+            # Python para manipular JSON limpiamente.
+            # No usar sed en JSON: es frágil y propensa a errores.
+            python3 << PYEOF
+import json
+from datetime import datetime, timezone
+
+with open("${SCHEDULE_FILE}", "r") as f:
+    data = json.load(f)
+
+data["status"] = "triggered"
+data["triggered_at"] = datetime.now(timezone.utc).isoformat()
+
+with open("${SCHEDULE_FILE}", "w") as f:
+    json.dump(data, f, indent=2)
+PYEOF
+
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git config user.name "GitHub Actions Bot"
+            git add "${SCHEDULE_FILE}"
+            git commit -m "chore: mark deploy ${TAG} as triggered [no-release]"
+            git push origin main
+          fi
