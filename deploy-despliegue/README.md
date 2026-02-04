@@ -1,210 +1,419 @@
-# Production Deployment System
+# 🚀 Production Deployment System
 
-Sistema de despliegue a producción con GitHub Actions, environments con aprobación obligatoria y runners self-hosted on-premise. Incluye versionado semántico automático, deploy programado, y rollback automático y manual.
+Sistema profesional de despliegue a producción con GitHub Actions, environments con aprobación obligatoria y runners self-hosted on-premise.
+
+**Características principales:**
+- ✅ Versionado semántico automático (SemVer)
+- ⏰ Deploy programado con fecha y hora específica
+- 🔄 Rollback automático ante fallos
+- 🔙 **Rollback manual independiente con triple protección**
+- 🏥 Health checks automáticos
+- 📋 Notificaciones automáticas vía GitHub Issues
+- 🔐 Aprobación obligatoria para producción
 
 ---
 
-## Contenido
+## 📚 Contenido
 
-- [Arquitectura](#arquitectura)
-- [Workflows](#workflows)
+### Inicio rápido
+- [Arquitectura general](#arquitectura-general)
 - [Configuración inicial](#configuración-inicial)
-- [Secrets y variables](#secrets-y-variables)
-- [Estructura de archivos del repo](#estructura-de-archivos-del-repo)
-- [Versionado semántico](#versionado-semántico)
-- [Cómo crear un release](#cómo-crear-un-release)
-- [Cómo hacer rollback manual](#cómo-hacer-rollback-manual)
+- [Guía para desarrolladores: Crear un release](#guía-para-desarrolladores-crear-un-release)
+
+### Operaciones críticas
+- [🔙 **Rollback manual** (IMPORTANTE)](#-rollback-manual)
 - [Rollback automático vs manual](#rollback-automático-vs-manual)
+- [Troubleshooting](#troubleshooting)
+
+### Referencia técnica
+- [Workflows en detalle](#workflows-en-detalle)
+- [Secrets y variables](#secrets-y-variables)
+- [Estructura de archivos](#estructura-de-archivos-del-repo)
+- [Versionado semántico](#versionado-semántico)
 - [Labels de issues](#labels-de-issues)
-- [Riesgos conocidos y mitigaciones](#riesgos-conocidos-y-mitigaciones)
+- [Riesgos y mitigaciones](#riesgos-conocidos-y-mitigaciones)
 - [FAQ](#faq)
 
 ---
 
-## Arquitectura
+## 🏗️ Arquitectura general
 
-El sistema está compuesto por 4 workflows. Cada uno tiene una única responsabilidad. La única comunicación entre workflows es un archivo JSON en el repo y la API de GitHub para disparar workflows.
+El sistema está compuesto por **4 workflows independientes**. Cada uno tiene una única responsabilidad. La comunicación entre workflows es explícita: archivo JSON en el repo + API de GitHub.
 
 ```
-PR merge → main
+┌─────────────────────────────────────────────────────────────────┐
+│                        FLUJO NORMAL                              │
+└─────────────────────────────────────────────────────────────────┘
+
+PR merge → main (con [release] y DEPLOY_SCHEDULED)
     │
     ▼
-┌─────────────────────┐
-│   1. release.yml    │  → Crea tag vX.Y.Z
-│   github-hosted     │  → Crea archivo de schedule
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│ 2. deploy-schedule  │  → Cron cada 5 min
-│    .yml             │  → Espera la hora programada
-│   github-hosted     │  → Dispara deploy-production via API
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│  3. deploy-         │  → Checkout del tag exacto
-│     production.yml  │  → Build + Deploy
-│   self-hosted       │  → Health check
-│                     │  → Rollback AUTO si falla
-└──────────┬──────────┘
-           │
-     ┌─────┴──────┐
-     ▼            ▼
-  Exitoso     Falla → Rollback AUTO
-                          │
-                    ┌─────┴──────┐
-                    ▼            ▼
-                 Exitoso     Falla → Alerta crítica
-                                         │
-                                         ▼
-                              ┌─────────────────────┐
-                              │  4. rollback-manual  │
-                              │     .yml             │
-                              │   self-hosted        │
-                              │   (intervención      │
-                              │    humana)           │
-                              └─────────────────────┘
-```
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. RELEASE.YML                            Runner: github-hosted  │
+│ ─────────────────────────────────────────────────────────────── │
+│ • Lee [major], [minor], o [patch] del PR                        │
+│ • Crea tag semántico vX.Y.Z                                     │
+│ • Extrae DEPLOY_SCHEDULED del PR                                │
+│ • Crea archivo .github/deploy-schedule/vX.Y.Z.json              │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 2. DEPLOY-SCHEDULE.YML                    Runner: github-hosted  │
+│ ─────────────────────────────────────────────────────────────── │
+│ • Cron cada 5 minutos                                           │
+│ • Lee archivos de schedule                                      │
+│ • Compara hora actual vs hora programada                        │
+│ • Si hora >= programada → dispara deploy-production via API     │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 3. DEPLOY-PRODUCTION.YML                  Runner: self-hosted   │
+│ ─────────────────────────────────────────────────────────────── │
+│ • Validaciones (github-hosted, rápido)                          │
+│ • Checkout del tag exacto en self-hosted                        │
+│ • Build de la aplicación                                        │
+│ • Deploy a producción                                           │
+│ • Health check (10 reintentos × 15s)                            │
+│ • Si exitoso → actualiza .deploy/current-production.json        │
+│ • Si falla → ROLLBACK AUTOMÁTICO ↓                              │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                   ┌─────────┴──────────┐
+                   ▼                    ▼
+             ✅ EXITOSO            ❌ FALLA
+                                        │
+                                        ▼
+                         ┌──────────────────────────┐
+                         │ ROLLBACK AUTOMÁTICO      │
+                         │ (dentro del mismo        │
+                         │  workflow)               │
+                         └─────────┬────────────────┘
+                                   │
+                         ┌─────────┴─────────┐
+                         ▼                   ▼
+                    ✅ EXITOSO          ❌ FALLA
+                                            │
+                                            ▼
+                                   🚨 ALERTA CRÍTICA
+                                   Requiere intervención
+                                            │
+                                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 4. ROLLBACK-MANUAL.YML                    Runner: self-hosted   │
+│ ─────────────────────────────────────────────────────────────── │
+│ • Workflow INDEPENDIENTE (no comparte estado)                   │
+│ • Se dispara manualmente desde GitHub UI                        │
+│ • Triple protección (ver sección dedicada)                      │
+│ • Permite rollback a cualquier versión anterior                 │
+└─────────────────────────────────────────────────────────────────┘
 
-`rollback-manual.yml` también se puede disparar directamente en cualquier momento, no solo cuando el rollback automático falla. Se usa para cualquier situación que requiera revertir a una versión conocida.
+NOTA: rollback-manual.yml también se puede usar en cualquier momento,
+      no solo cuando el automático falla. Ejemplo: bug detectado
+      horas después de un deploy exitoso.
+```
 
 ---
 
-## Workflows
+## ⚙️ Configuración inicial
 
-| # | Archivo | Trigger | Runner | Responsabilidad |
-|---|---------|---------|--------|-----------------|
-| 1 | `release.yml` | `push` a `main` | `github-hosted` | Crear tag semántico y archivo de schedule |
-| 2 | `deploy-schedule.yml` | `cron */5 * * * *` + `workflow_dispatch` | `github-hosted` | Vigilar la hora y disparar el deploy |
-| 3 | `deploy-production.yml` | `workflow_dispatch` | `self-hosted` (deploy y rollback) | Deploy real, health check, rollback automático |
-| 4 | `rollback-manual.yml` | `workflow_dispatch` | `self-hosted` (ejecución) | Rollback manual independiente |
-
-### Permisos por workflow
-
-| Workflow | `contents` | `actions` | `issues` | `deployments` |
-|----------|:----------:|:---------:|:--------:|:-------------:|
-| `release.yml` | `write` | — | — | — |
-| `deploy-schedule.yml` | `read` | `write` | — | — |
-| `deploy-production.yml` | `write` | — | `write` | `write` |
-| `rollback-manual.yml` | `write` | — | `write` | `write` |
-
-### Runners por job
-
-Solo los jobs que necesitan acceder a la infraestructura on-premise usan `self-hosted`. El resto corre en `github-hosted` para minimizar el tiempo de ocupación del runner.
-
-| Workflow | Job | Runner |
-|----------|-----|--------|
-| `release.yml` | `create-tag` | `github-hosted` |
-| `deploy-schedule.yml` | `check-schedule` | `github-hosted` |
-| `deploy-production.yml` | `validar` | `github-hosted` |
-| `deploy-production.yml` | `deploy` | `self-hosted` |
-| `deploy-production.yml` | `rollback` | `self-hosted` |
-| `deploy-production.yml` | `notificar` | `github-hosted` |
-| `rollback-manual.yml` | `validar` | `github-hosted` |
-| `rollback-manual.yml` | `ejecutar-rollback` | `self-hosted` |
-| `rollback-manual.yml` | `notificar` | `github-hosted` |
-
----
-
-## Configuración inicial
-
-### 1. GitHub Environment
-
-Crear el environment `production` desde la UI de GitHub:
+### 1. GitHub Environment `production`
 
 ```
-Settings → Environments → New environment
+Ruta: Settings → Environments → New environment
 
-Nombre: production
-
-Protection Rules:
-  ✓ Required reviewers    → seleccionar al menos 1 persona del equipo
-  ○ Wait timer            → 0 minutos (el wait lo maneja el cron)
-
-Deployment branches:
-  ✓ Solo permitir desde: main
+┌──────────────────────────────────────────────────────┐
+│ Environment name: production                          │
+├──────────────────────────────────────────────────────┤
+│                                                       │
+│ ✓ Environment protection rules:                      │
+│   ✓ Required reviewers                               │
+│     → Seleccionar al menos 1 persona del equipo      │
+│     → Recomendado: 2 personas del equipo DevOps      │
+│                                                       │
+│   ○ Wait timer: 0 minutes                            │
+│     (el tiempo de espera lo maneja el cron)          │
+│                                                       │
+│ ✓ Deployment branches:                               │
+│   ✓ Selected branches                                │
+│     → main                                           │
+│                                                       │
+│ Secrets (accesibles solo desde este environment):   │
+│   → DEPLOY_HEALTH_CHECK_URL                          │
+│   → [otros secrets según tu mecanismo de deploy]     │
+└──────────────────────────────────────────────────────┘
 ```
-
-Los secrets de esta sección solo son accesibles por jobs que declaren `environment: production`. Esto aplica a los jobs `deploy` y `ejecutar-rollback` de los workflows 3 y 4.
 
 ### 2. Runner self-hosted
 
-El runner debe estar conectado al repositorio y tener acceso de red a los servidores de producción.
+```bash
+# En tu servidor on-premise:
 
-```
-Settings → Actions → Runners → New self-hosted runner
+# 1. Ir a Settings → Actions → Runners → New self-hosted runner
+# 2. Seguir las instrucciones según tu SO
+# 3. Al configurar, usar esta etiqueta:
 
-Instalar según el SO del servidor on-premise.
-Etiquetar el runner con: self-hosted
-```
+./config.sh --labels self-hosted
 
-### 3. Labels de issues
+# 4. Iniciar el runner
+./run.sh
 
-Crear estos labels en el repositorio antes de usar el sistema, para que las notificaciones funcionen sin errores:
-
-```
-deploy
-exitoso
-fallo
-rollback-auto
-rollback-manual
-abortado
-requiere-revision
-intervención-manual
-CRÍTICO
+# 5. Verificar que aparece "Idle" en GitHub UI
 ```
 
-### 4. Directorio `.deploy`
+**Requisitos del runner:**
+- Acceso de red a servidores de producción
+- Herramientas instaladas según tu stack (docker, kubectl, npm, etc.)
+- Permisos para ejecutar el mecanismo de deploy
 
-Crear el directorio en el repo raíz con un `.gitkeep`:
+### 3. Labels de GitHub Issues
 
+Crear estos labels para las notificaciones automáticas:
+
+| Label | Color | Uso |
+|-------|-------|-----|
+| `deploy` | `#0052CC` | Todos los eventos de deploy |
+| `exitoso` | `#00875A` | Deploy/rollback exitoso |
+| `fallo` | `#DE350B` | Deploy/rollback falló |
+| `rollback-auto` | `#FF991F` | Rollback automático |
+| `rollback-manual` | `#6554C0` | Rollback manual |
+| `abortado` | `#97A0AF` | Abortado en validación |
+| `requiere-revision` | `#FFAB00` | Requiere investigación |
+| `intervención-manual` | `#FF5630` | Requiere acción humana |
+| `CRÍTICO` | `#BF2600` | Estado crítico del sistema |
+
+### 4. Estructura de directorios
+
+```bash
+# Crear estos directorios en el repo raíz:
+mkdir -p .github/deploy-schedule
+mkdir -p .deploy
+
+# Agregar .gitkeep para commitear directorios vacíos:
+touch .github/deploy-schedule/.gitkeep
+touch .deploy/.gitkeep
+
+git add .github/deploy-schedule/.gitkeep .deploy/.gitkeep
+git commit -m "chore: crear estructura para deploy system"
+git push origin main
 ```
-.deploy/
-  .gitkeep
-```
-
-El archivo `current-production.json` se crea automáticamente tras el primer deploy exitoso.
 
 ---
 
-## Secrets y variables
+## 👨‍💻 Guía para desarrolladores: Crear un release
 
-Todos los secrets se configuran en el environment `production` (no en el repositorio general), excepto `GITHUB_TOKEN` que es automático.
+### Paso 1: Crear la branch de release
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b release/v2.4.0
+```
+
+### Paso 2: Preparar el PR
+
+Abrir un Pull Request de `release/v2.4.0` hacia `main`.
+
+**Descripción del PR (incluir AMBOS campos):**
+
+```markdown
+[release] [minor] Se agrega nuevo endpoint de exportación
+
+DEPLOY_SCHEDULED: 2026-02-10T22:00:00+01:00
+
+## Cambios incluidos
+- ✨ Nuevo endpoint GET /api/export
+- 📝 Soporta formatos CSV y XLSX
+- ✅ Tests incluidos
+```
+
+**Campos obligatorios:**
+
+1. **Marca de tipo**: `[major]`, `[minor]`, `[patch]` o ninguno (default: patch)
+2. **Fecha y hora**: `DEPLOY_SCHEDULED: YYYY-MM-DDTHH:MM:SS±HH:MM`
+
+### Paso 3: Aprobar y hacer merge
+
+Al hacer merge a `main` → el sistema se activa automáticamente.
+
+---
+
+## 🔙 Rollback manual
+
+### 🚨 Cuándo usar
+
+- ❌ Deploy falló y rollback automático también falló (CRÍTICO)
+- 🐛 Bug detectado horas después de un deploy exitoso
+- ⚠️ Problema de performance en producción
+- 🔥 Emergencia fuera de horario
+
+### 🛡️ Triple sistema de protección
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ CAPA 1: CONFIRMACIÓN TEXTUAL                                │
+├─────────────────────────────────────────────────────────────┤
+│ El operador debe escribir exactamente:                       │
+│     CONFIRMO ROLLBACK                                        │
+│ ❌ Si NO coincide → workflow muere                           │
+│ ✅ Si coincide → continúa a Capa 2                           │
+└─────────────────────────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ CAPA 2: VALIDACIONES AUTOMÁTICAS                            │
+├─────────────────────────────────────────────────────────────┤
+│ ✓ Formato del tag (vX.Y.Z)                                  │
+│ ✓ El tag existe en git                                      │
+│ ✓ Tag destino ≠ versión actual                              │
+│ ✓ Tag destino < versión actual                              │
+│ ❌ Si CUALQUIERA falla → workflow muere                      │
+│ ✅ Si TODAS pasan → continúa a Capa 3                        │
+└─────────────────────────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ CAPA 3: APROBACIÓN HUMANA                                   │
+├─────────────────────────────────────────────────────────────┤
+│ El workflow PAUSA y espera aprobación.                       │
+│ El reviewer ve:                                              │
+│   • Tag destino                                             │
+│   • Versión actual                                          │
+│   • Motivo                                                  │
+│   • Resumen de validaciones                                 │
+│ ❌ Si rechaza → workflow muere                              │
+│ ✅ Si aprueba → ejecución en self-hosted                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 📋 Pasos para ejecutar
+
+#### 1. Ir a GitHub Actions
+
+```
+GitHub → Tu repo → Actions → "Manual Rollback - Production" → "Run workflow"
+```
+
+#### 2. Rellenar formulario
+
+| Campo | Ejemplo | Obligatorio |
+|-------|---------|:-----------:|
+| `tag_destino` | `v2.3.1` | ✅ |
+| `motivo` | `Bug crítico en checkout` | ✅ |
+| `confirmacion` | `CONFIRMO ROLLBACK` | ✅ |
+
+#### 3. Validaciones automáticas
+
+El sistema valida automáticamente (1-2 min).
+
+#### 4. Aprobar
+
+Solo para reviewers autorizados. El workflow se pausa y muestra resumen completo antes de ejecutar.
+
+#### 5. Ejecución
+
+Tras aprobación (5-10 min):
+- Checkout del tag destino
+- Build
+- Deploy
+- Health check
+- Actualización de `.deploy/current-production.json`
+- Issue de notificación
+
+### 📊 Resultado
+
+**Si exitoso ✅:**
+- Issue: "✅ Rollback manual exitoso: producción ahora en v2.3.1"
+- Labels: `rollback-manual`, `exitoso`
+
+**Si falla ❌:**
+- Issue: "🚨 CRÍTICO: Rollback manual FALLÓ"
+- Labels: `rollback-manual`, `CRÍTICO`
+- Requiere intervención directa en servidor
+
+### 💡 Casos de uso
+
+**Caso 1: Bug crítico**
+```
+23:00 - Bug detectado
+23:03 - Inicia rollback manual a v2.3.1
+23:05 - Aprobación
+23:10 - Rollback completado ✅
+```
+
+**Caso 2: Rollback automático falló**
+```
+22:05 - Deploy falla
+22:06 - Rollback automático falla ❌
+22:08 - Issue crítico creado
+22:10 - Inicia rollback manual
+22:15 - Rollback manual exitoso ✅
+```
+
+---
+
+## 🔄 Rollback automático vs manual
+
+| Aspecto | Automático | Manual |
+|---------|-----------|--------|
+| **Workflow** | Dentro de deploy-production.yml | rollback-manual.yml independiente |
+| **Trigger** | Automático (health check falla) | Manual desde GitHub UI |
+| **Versión** | Tag anterior automático | Especificada por operador |
+| **Aprobación** | No (ya aprobado en deploy) | Sí (environment production) |
+| **Confirmación** | No | Sí (CONFIRMO ROLLBACK) |
+| **Tiempo** | ~3-5 min | ~5-10 min |
+
+**Ambos usan:**
+- ✅ Mismo mecanismo de deploy
+- ✅ Mismo health check (10 × 15s)
+- ✅ Mismo runner (self-hosted)
+
+---
+
+## 📁 Workflows en detalle
+
+| # | Workflow | Trigger | Runner | Timeout |
+|---|----------|---------|--------|---------|
+| 1 | release.yml | push → main | github-hosted | — |
+| 2 | deploy-schedule.yml | cron */5 * * * * | github-hosted | — |
+| 3 | deploy-production.yml | workflow_dispatch | mixed | 30 min |
+| 4 | rollback-manual.yml | workflow_dispatch | mixed | 30 min |
+
+---
+
+## 🔐 Secrets y variables
+
+### Secrets en environment `production`
 
 | Secret | Descripción | Ejemplo |
 |--------|-------------|---------|
-| `DEPLOY_HEALTH_CHECK_URL` | URL que retorna HTTP 200 cuando la app está sana | `https://api.produccion.com/health` |
+| `DEPLOY_HEALTH_CHECK_URL` | URL health check | `https://api.prod.com/health` |
+| `GITHUB_TOKEN` | Automático | (proporcionado por GitHub) |
 
-El `GITHUB_TOKEN` es proporcionado automáticamente por GitHub Actions en cada ejecución. No se configura manualmente.
-
-Si tu mecanismo de deploy requiere acceso SSH o credenciales adicionales (ej: registro de Docker, kubeconfig), agrégalos como secrets adicionales en el environment `production` y referencíalos en los steps de deploy y rollback.
+Agregar según tu stack: `DOCKER_*`, `KUBECONFIG_*`, `AWS_*`, `SSH_*`, etc.
 
 ---
 
-## Estructura de archivos del repo
-
-Estos archivos son creados y gestionados automáticamente por los workflows. No los edites manualmente.
+## 📂 Estructura de archivos del repo
 
 ```
 .github/
   workflows/
-    release.yml                          # Workflow 1
-    deploy-schedule.yml                  # Workflow 2
-    deploy-production.yml                # Workflow 3
-    rollback-manual.yml                  # Workflow 4
+    release.yml
+    deploy-schedule.yml
+    deploy-production.yml
+    rollback-manual.yml
   deploy-schedule/
-    v1.0.0.json                          # Creado por release.yml tras cada merge
-    v1.1.0.json                          # Uno por cada versión
+    v1.0.0.json
+    v1.1.0.json
     ...
 
 .deploy/
-  current-production.json                # Fuente de verdad: qué versión está activa
+  current-production.json
 ```
 
 ### `.github/deploy-schedule/vX.Y.Z.json`
-
-Creado por `release.yml`. Leído por `deploy-schedule.yml`.
 
 ```json
 {
@@ -216,11 +425,7 @@ Creado por `release.yml`. Leído por `deploy-schedule.yml`.
 }
 ```
 
-El campo `status` pasa de `pending` a `triggered` cuando el cron dispara el deploy. Una vez en `triggered`, el cron lo ignora en las siguientes iteraciones.
-
 ### `.deploy/current-production.json`
-
-Escrito por `deploy-production.yml` tras un deploy exitoso, y por `rollback-manual.yml` tras un rollback exitoso. Es la única forma en que los workflows comparten estado.
 
 ```json
 {
@@ -228,237 +433,137 @@ Escrito por `deploy-production.yml` tras un deploy exitoso, y por `rollback-manu
   "deployed_at": "2026-02-10T21:00:00+00:00",
   "deployed_by": "username",
   "method": "deploy",
-  "workflow_run_id": "12345678",
-  "triggered_by": "schedule"
+  "workflow_run_id": "12345678"
 }
 ```
 
-El campo `method` puede ser `deploy` o `manual-rollback`, según qué workflow lo escribió.
+---
+
+## 🏷️ Versionado semántico
+
+```
+vX.Y.Z
+
+X = Major → Breaking changes
+Y = Minor → Nuevas features
+Z = Patch → Bugfixes
+```
+
+| Marca | Bump | Ejemplo |
+|-------|------|---------|
+| `[major]` | v2.3.1 → v3.0.0 | Breaking |
+| `[minor]` | v2.3.1 → v2.4.0 | Features |
+| `[patch]` | v2.3.1 → v2.3.2 | Fixes |
+| (ninguno) | v2.3.1 → v2.3.2 | Default |
 
 ---
 
-## Versionado semántico
+## 🏷️ Labels de issues
 
-El sistema usa Semantic Versioning estricto con formato `vX.Y.Z`.
-
-| Campo | Significa | Ejemplo |
-|-------|-----------|---------|
-| `X` (Major) | Breaking changes | API incompatible con versión anterior |
-| `Y` (Minor) | Nuevas funcionalidades | Nuevo endpoint, nueva feature |
-| `Z` (Patch) | Bugfixes | Corrección de un error |
-
-### Cómo se calcula el bump
-
-El bump se determina automáticamente leyendo el mensaje del commit de merge. El orden de prioridad es `major > minor > patch`.
-
-| Contenido en el mensaje del PR | Bump | Ejemplo |
-|-------------------------------|------|---------|
-| `[major]` | Major | `v2.3.1` → `v3.0.0` |
-| `[minor]` | Minor | `v2.3.1` → `v2.4.0` |
-| `[patch]` o ninguno | Patch | `v2.3.1` → `v2.3.2` |
-
-Si el mensaje no contiene ninguna marca, el default es `patch`. Es el más seguro como fallback.
+| Labels | Situación | Acción |
+|--------|-----------|--------|
+| `deploy`, `exitoso` | Deploy OK | Ninguna |
+| `deploy`, `rollback-auto`, `requiere-revision` | Deploy falló, rollback OK | Investigar |
+| `deploy`, `rollback-auto`, `CRÍTICO` | Ambos fallaron | Rollback manual YA |
+| `rollback-manual`, `exitoso` | Rollback manual OK | Investigar causa |
+| `rollback-manual`, `CRÍTICO` | Rollback manual falló | Intervención servidor |
 
 ---
 
-## Cómo crear un release
+## ⚠️ Riesgos conocidos y mitigaciones
 
-Este es el flujo completo desde el punto de vista del desarrollador.
+### 1. Race condition tag
 
-### Paso 1: Crear la branch de release
+**Mitigación:** deploy-schedule verifica existencia antes de disparar.
+
+### 2. Runner con estado sucio
+
+**Mitigación:** `rm -rf workspace` antes de cada checkout.
+
+### 3. Secrets expuestos
+
+**Mitigación:** Secrets en environment production, no en logs.
+
+### 4. Timezone incorrecto
+
+**Mitigación:** ISO 8601 obligatorio con timezone, conversión automática.
+
+### 5. Mecanismos diferentes
+
+**Mitigación:** Comentarios explícitos (`═══ REEMPLAZAR ═══`) en 3 lugares.
+
+### 6. Rollback accidental
+
+**Mitigación:** Triple capa de protección.
+
+---
+
+## 🛠️ Troubleshooting
+
+### Cron no dispara
+
+1. Verificar archivo schedule existe
+2. Verificar `status: pending`
+3. Ver runs de deploy-schedule
+4. Usar fallback manual: `force_tag`
+
+### Rollback falla en validaciones
+
+| Error | Causa | Solución |
+|-------|-------|----------|
+| Confirmación inválida | Texto no coincide | Escribir exactamente |
+| Formato inválido | No es vX.Y.Z | Corregir formato |
+| Tag no existe | No está en git | Ver `git tag -l` |
+| Es igual al actual | Misma versión | Elegir otra |
+| No es menor | Es forward deploy | Elegir versión anterior |
+
+### Health check falla siempre
+
+1. Verificar secret `DEPLOY_HEALTH_CHECK_URL`
+2. Verificar conectividad desde runner
+3. Verificar endpoint `/health` existe y retorna 200
+
+### Runner offline
 
 ```bash
-git checkout develop
-git pull origin develop
-git checkout -b release/v2.4.0
-```
-
-### Paso 2: Hacer los cambios y abrir el PR
-
-Crear un Pull Request de `release/v2.4.0` hacia `main`. En la descripción del PR incluir dos cosas obligatorias.
-
-La marca de tipo de cambio (una de las tres):
-
-```
-[release] [minor] Se agrega nuevo endpoint de exportación
-```
-
-La fecha y hora de deploy programado en formato ISO 8601 con timezone:
-
-```
-DEPLOY_SCHEDULED: 2026-02-10T22:00:00+01:00
-```
-
-Ejemplo completo de descripción del PR:
-
-```
-[release] [minor] Se agrega nuevo endpoint de exportación
-
-DEPLOY_SCHEDULED: 2026-02-10T22:00:00+01:00
-
-- Nuevo endpoint GET /api/export
-- Soporta formatos CSV y XLSX
-- Tests unitarios y de integración incluidos
-```
-
-> **Nota sobre timezones:** GitHub Actions opera en UTC. El sistema convierte automáticamente la fecha que escribas (con cualquier timezone válido) a UTC internamente. Si escribes `22:00:00+01:00` (Madrid), el sistema lo convierte a `21:00:00Z` (UTC).
-
-### Paso 3: Aprobar y hacer merge
-
-El PR debe recibir la aprobación requerida por las reglas del repositorio. Al hacer merge a `main`, el sistema se activa automáticamente:
-
-1. `release.yml` detecta el push a `main`, lee `[release]` en el mensaje, crea el tag `v2.4.0` y el archivo de schedule.
-2. `deploy-schedule.yml` escanea cada 5 minutos. Cuando la hora actual alcanza la hora programada, dispara `deploy-production.yml`.
-3. `deploy-production.yml` hace checkout del tag `v2.4.0` en el runner self-hosted, ejecuta build, deploy, y health check.
-
-No hay nada más que hacer. El sistema maneja el resto.
-
----
-
-## Cómo hacer rollback manual
-
-### Cuándo usar rollback manual
-
-- El rollback automático falló (la notificación en GitHub lo indica con label `CRÍTICO`).
-- Se detectó un bug después de un deploy exitoso y se necesita revertir.
-- Intervención de emergencia fuera de horario.
-
-### Pasos
-
-Ir a `Actions → Manual Rollback - Production → Run workflow` y rellenar los campos:
-
-| Campo | Ejemplo | Requerido |
-|-------|---------|:---------:|
-| `tag_destino` | `v2.3.1` | ✓ |
-| `motivo` | `Bug crítico en v2.4.0 que afecta checkout` | ✓ |
-| `confirmación` | `CONFIRMO ROLLBACK` | ✓ |
-
-El campo `confirmación` debe contener exactamente el texto `CONFIRMO ROLLBACK`. Es un filtro deliberado contra ejecuciones accidentales. Si no coincide exactamente, el workflow se detiene en el primer paso sin ejecutar nada.
-
-Tras rellenar los campos y dar a `Run workflow`, el sistema ejecuta las validaciones automáticamente. Si todas pasan, el workflow se pausa esperando la aprobación del environment `production`. Un miembro del equipo debe aprobar desde la UI de GitHub antes de que el rollback se ejecute en el runner.
-
-### Tres capas de protección
-
-El rollback manual tiene tres capas de seguridad independientes, aplicadas en orden:
-
-```
-Capa 1: Confirmación textual
-  → El usuario debe escribir "CONFIRMO ROLLBACK" exactamente.
-  → Si no coincide, el workflow muere. Nada se ejecuta.
-
-Capa 2: Validaciones automáticas
-  → Formato del tag (regex vX.Y.Z estricto)
-  → Existencia del tag en git
-  → El tag destino no es igual al que está activo
-  → El tag destino es menor versión que el activo (es un rollback real)
-  → Si cualquier validación falla, el workflow muere.
-
-Capa 3: Aprobación del environment
-  → El workflow se pausa hasta que un reviewer apruebe desde GitHub
-  → El reviewer ve el resumen de todas las validaciones antes de aprobar
-  → El runner self-hosted no se ocupa hasta que hay aprobación
+cd ~/actions-runner
+./svc.sh stop
+./svc.sh start
+./svc.sh status
 ```
 
 ---
 
-## Rollback automático vs manual
+## ❓ FAQ
 
-| Aspecto | Automático | Manual |
-|---------|-----------|--------|
-| Workflow | Dentro de `deploy-production.yml` (job `rollback`) | `rollback-manual.yml` (workflow independiente) |
-| Se activa | Automáticamente cuando el health check del deploy falla | Manualmente por un operador |
-| Requiere aprobación | No (ya fue aprobado cuando se aprobó el deploy) | Sí (environment `production`) |
-| Versión destino | Calculada automáticamente (tag anterior) | Especificada por el operador |
-| Comparte estado con otros workflows | Sí (parte de deploy-production) | No (completamente independiente) |
-| Confirmación textual | No | Sí (`CONFIRMO ROLLBACK`) |
+**¿Qué pasa si el cron no es exacto?**  
+Latencia de segundos a minutos. Con cron cada 5 min, máximo ~5 min de retraso. Aceptable para prod.
 
-Ambos tipos de rollback usan exactamente el mismo mecanismo de deploy y los mismos parámetros de health check: 10 reintentos cada 15 segundos. Si cambias cómo se deploya en uno, debe cambiarse en el otro.
+**¿Dos merges rápidos?**  
+Ambos se procesan en orden FIFO.
 
----
+**¿Desplegar sin esperar?**  
+Sí: `deploy-schedule.yml` → Run workflow → `force_tag: v2.4.0`
 
-## Labels de issues
+**¿Primera versión sin anterior?**  
+Rollback automático crea alerta. Usar rollback manual con otra estrategia.
 
-El sistema crea issues automáticamente como notificación de cada evento. Estos son los labels que se usan y qué significan:
+**¿Rollback a versión no-inmediata?**  
+Sí, con rollback manual.
 
-| Labels | Situación | Acción requerida |
-|--------|-----------|------------------|
-| `deploy`, `exitoso` | Deploy completado sin problemas | Ninguna |
-| `deploy`, `rollback-auto`, `requiere-revision` | Deploy falló, rollback automático exitoso | Investigar qué falló |
-| `deploy`, `rollback-auto`, `CRÍTICO` | Deploy falló y rollback automático también falló | Usar `rollback-manual.yml` inmediatamente |
-| `deploy`, `fallo`, `intervención-manual` | Deploy falló, no hay versión anterior | Intervención manual |
-| `rollback-manual`, `exitoso` | Rollback manual completado | Investigar causa original |
-| `rollback-manual`, `abortado` | Rollback manual abortado en validación | Revisar los logs |
-| `rollback-manual`, `CRÍTICO` | Rollback manual falló | Intervenir directamente en el servidor |
-| `rollback-manual`, `requiere-revision` | Estado inesperado | Revisar manualmente |
+**¿Dónde cambio mecanismo deploy?**  
+3 lugares (buscar `═══ REEMPLAZAR ═══`):
+1. deploy-production → job deploy
+2. deploy-production → job rollback
+3. rollback-manual → job ejecutar-rollback
 
----
+**¿Quién puede aprobar?**  
+Required reviewers del environment production.
 
-## Riesgos conocidos y mitigaciones
-
-### Race condition entre merge y creación de tag
-
-Si hay latencia entre el merge a `main` y la creación del tag por `release.yml`, el cron de `deploy-schedule` puede buscar un tag que aún no existe.
-
-**Mitigación:** `deploy-schedule.yml` verifica la existencia del tag con `git rev-parse` antes de disparar el deploy. Si no existe, no dispara y el cron reintenta en 5 minutos. No falla el workflow.
-
-### Self-hosted runner con estado sucio
-
-Los runners self-hosted mantienen el estado entre ejecuciones. Código o artefactos de un deploy anterior pueden contaminar el siguiente.
-
-**Mitigación:** Cada job que corre en self-hosted hace `rm -rf` del workspace como primer paso, antes de cualquier checkout.
-
-### Secrets expuestos en logs
-
-Los runners self-hosted tienen mayor riesgo de leak de secrets que los github-hosted.
-
-**Mitigación:** Los secrets se configuran en el environment `production`, no en el repositorio general. Solo son accesibles por jobs que declaren ese environment. Ningún workflow printea variables de entorno en los logs.
-
-### Timezone incorrecto en DEPLOY_SCHEDULED
-
-GitHub Actions opera en UTC. Un desarrollador puede programar una hora sin notar el offset del timezone.
-
-**Mitigación:** El formato requerido es ISO 8601 con timezone explícito (`2026-02-10T22:00:00+01:00`). El workflow valida que sea un formato válido y lo convierte a UTC epoch internamente. Si el formato es inválido, el workflow falla con mensaje claro.
-
-### Deploy y rollback usan mecanismos diferentes
-
-Si el deploy usa docker-compose y el rollback usa otro método, el rollback puede no funcionar correctamente.
-
-**Mitigación:** Los comentarios en el código de los tres places donde hay deploy (deploy-production job `deploy`, deploy-production job `rollback`, rollback-manual job `ejecutar-rollback`) indican explícitamente que deben usar el mismo mecanismo. Busca los comentarios marcados con `═══ REEMPLAZAR ═══`.
-
-### Rollback manual disparado por error
-
-Un click accidental en "Run workflow" puede iniciar un rollback a producción.
-
-**Mitigación:** Tres capas de protección independientes (confirmación textual, validaciones automáticas, aprobación del environment). Las tres deben pasar para que algo se ejecute en el runner.
+**¿Cambiar frecuencia cron?**  
+Editar `deploy-schedule.yml` → `cron: '*/10 * * * *'`
 
 ---
 
-## FAQ
-
-**¿Qué pasa si el cron de deploy-schedule no se ejecuta exactamente a la hora programada?**
-
-GitHub no garantiza precisión al segundo en los cron de schedule. En la práctica la latencia es de segundos a unos minutos. Como el cron corre cada 5 minutos, la latencia máxima es de aproximadamente 5 minutos. Para deploys programados en producción esto es aceptable.
-
-**¿Qué pasa si hay dos merges rápidos a main antes de que el primer deploy se ejecute?**
-
-Cada merge crea un tag y un archivo de schedule independiente. El cron de deploy-schedule procesa los archivos en orden FIFO (el más antiguo primero). En la práctica no debería haber más de un deploy pendiente a la vez, pero el sistema lo maneja correctamente si ocurre.
-
-**¿Puedo desplegar una versión específica sin esperar al cron?**
-
-Sí. `deploy-schedule.yml` tiene un `workflow_dispatch` con un campo `force_tag`. Introduci el tag y el workflow dispara el deploy inmediatamente, sin esperar al cron.
-
-**¿Qué pasa si es la primera versión (v1.0.0) y el deploy falla?**
-
-No existe versión anterior para rollback automático. El rollback automático se marca como no disponible y se crea una alerta crítica. Se debe usar `rollback-manual.yml` o intervenir directamente en el servidor.
-
-**¿Puedo hacer rollback a una versión que no es la inmediatamente anterior?**
-
-Sí, pero solo con `rollback-manual.yml`. El rollback automático siempre va al tag inmediatamente anterior. El rollback manual permite especificar cualquier tag que exista en el repositorio, siempre que sea menor versión que la activa.
-
-**¿Qué archivo debo editar para cambiar el mecanismo de deploy?**
-
-Hay tres places donde está el deploy: el job `deploy` y el job `rollback` de `deploy-production.yml`, y el job `ejecutar-rollback` de `rollback-manual.yml`. Los tres deben usar exactamente el mismo mecanismo. Busca los comentarios marcados con `═══ REEMPLAZAR ═══` en cada archivo.
-
-**¿Quién puede aprobar deploys y rollbacks?**
-
-Cualquier persona que esté configurada como "Required reviewer" en el environment `production` de GitHub. Esto se configura en `Settings → Environments → production → Protection Rules`.
+**Última actualización:** 2026-02-03  
+**Mantenido por:** DevOps Team

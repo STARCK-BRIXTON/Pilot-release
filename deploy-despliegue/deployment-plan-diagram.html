@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Plan de Despliegue a Producción</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+        }
+        * {
+            box-sizing: border-box;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    
+    <script type="text/babel">
+        const { useState } = React;
+
+        // ─── TEMA ─────────────────────────────────────────────────────────
+        const T = {
+          bg: "#090b10",
+          surface: "#111419",
+          surfaceHi: "#161a24",
+          border: "#1e2330",
+          borderHi: "#2a3040",
+          text: "#b8bcc8",
+          textDim: "#535866",
+          textBright: "#eef0f4",
+
+          // Workflows
+          release: "#38bdf8",
+          releaseDim: "rgba(56,189,248,0.12)",
+          schedule: "#a78bfa",
+          scheduleDim: "rgba(167,139,250,0.12)",
+          deploy: "#34d399",
+          deployDim: "rgba(52,211,153,0.12)",
+          rollbackAuto: "#fb923c",
+          rollbackAutoDim: "rgba(251,146,60,0.12)",
+          rollbackManual: "#f472b6",
+          rollbackManualDim: "rgba(244,114,182,0.12)",
+
+          // Estados
+          ok: "#34d399",
+          okDim: "rgba(52,211,153,0.14)",
+          fail: "#f87171",
+          failDim: "rgba(248,113,113,0.14)",
+          warn: "#fbbf24",
+          warnDim: "rgba(251,191,36,0.14)",
+          critical: "#ef4444",
+          criticalDim: "rgba(239,68,68,0.18)",
+        };
+
+        // ─── DATOS ────────────────────────────────────────────────────────
+        const WORKFLOWS = [
+          {
+            id: "release",
+            label: "release.yml",
+            color: T.release,
+            dim: T.releaseDim,
+            icon: "🏷️",
+            trigger: "push → main",
+            runner: "github-hosted",
+            desc: "Crea el tag semántico vX.Y.Z tras merge. No toca infraestructura.",
+            steps: [
+              { title: "Checkout (fetch-depth: 0)", why: "Sin historial completo no puede ver tags anteriores para calcular la versión." },
+              { title: "Obtener último tag", why: "git describe --tags --abbrev=0. Si no existe ningún tag, usa v0.0.0 como base." },
+              { title: "Calcular bump (major/minor/patch)", why: "Lee labels del PR en el mensaje de merge. Major > Minor > Patch. Default: patch (más seguro)." },
+              { title: "Crear tag anotado", why: "Los tags anotados almacenan metadata (quién, cuándo). git describe los prefiere. Estándar de industria." },
+              { title: "Extraer DEPLOY_SCHEDULED del commit", why: "El developer lo incluye en el PR. Formato ISO 8601 con timezone. Se valida y convierte a UTC." },
+              { title: "Crear .github/deploy-schedule/vX.Y.Z.json", why: "El 'ticket de trabajo' para el cron. Comunicación explícita entre workflows via archivo en el repo." },
+            ],
+          },
+          {
+            id: "schedule",
+            label: "deploy-schedule.yml",
+            color: T.schedule,
+            dim: T.scheduleDim,
+            icon: "⏰",
+            trigger: "cron */5 * * * * + workflow_dispatch",
+            runner: "github-hosted",
+            desc: "El 'reloj' del sistema. Escanea JSONs cada 5 min. Solo dispara, no deploya.",
+            steps: [
+              { title: "Checkout del repo", why: "Necesita leer los archivos de schedule. fetch-depth: 0 para ver tags." },
+              { title: "¿Dispatch manual con tag forzado?", why: "Fallback de emergencia. Un admin puede desplegar sin esperar el cron." },
+              { title: "Escanear schedules pendientes", why: "Loop sobre *.json en deploy-schedule/. Compara epoch actual vs epoch programado. FIFO si hay varios." },
+              { title: "Validar existencia del tag en git", why: "Previene Race Condition: si el tag aún no existe por latencia, no dispara. El cron reintentará en 5 min." },
+              { title: "Disparar deploy-production.yml via API", why: "workflow_dispatch via API permite pasar inputs (tag). Más flexible que workflow_call para workflows desacoplados." },
+              { title: "Actualizar JSON a 'triggered'", why: "Previene que el cron dispare de nuevo la misma versión en la siguiente iteración." },
+            ],
+          },
+          {
+            id: "deploy",
+            label: "deploy-production.yml",
+            color: T.deploy,
+            dim: T.deployDim,
+            icon: "🚀",
+            trigger: "workflow_dispatch (llamado por schedule o manual)",
+            runner: "self-hosted 🖥️",
+            desc: "El deploy real. Checkout del tag exacto, build, deploy, health check. Incluye rollback automático si falla.",
+            steps: [
+              { title: "[Job: validar] Formato + existencia del tag", why: "Corre en github-hosted. Si falla, el self-hosted nunca se ocupa. Principio de menor privilegio." },
+              { title: "[Job: validar] Calcular tag anterior para rollback", why: "Si patch > 0, resta 1. Si patch = 0, busca el tag real anterior con git tag --sort. Verifica que existe." },
+              { title: "[Job: deploy] Clean workspace", why: "Obligatorio en self-hosted. Sin esto, estado de ejecuciones anteriores puede contaminar el deploy." },
+              { title: "[Job: deploy] Checkout exacto del tag (detached HEAD)", why: "ref: tag específico. Determinista: siempre el mismo código para el mismo tag." },
+              { title: "[Job: deploy] Verificar checkout con git describe", why: "Nunca asumas que checkout funcionó. En producción crítica, este check puede evitar un desastre." },
+              { title: "[Job: deploy] Build + Deploy", why: "El mecanismo de deploy debe ser el mismo que usa el rollback. No mezcles métodos." },
+              { title: "[Job: deploy] Health Check (10 reintentos × 15s)", why: "El deploy no es 'exitoso' hasta que la app responde HTTP 200. Sin esto es un deploy ciego." },
+              { title: "[Job: deploy] Actualizar .deploy/current-production.json", why: "Fuente de verdad de qué versión está activa. La lee rollback-manual para comparar versiones." },
+              { title: "[Job: rollback] Solo si deploy falla (if: failure())", why: "Job separado por visibilidad en la UI y porque un step que falla detiene los siguientes." },
+              { title: "[Job: rollback] Checkout del tag anterior + Deploy + Health Check", why: "Mismo mecanismo de deploy. Si este rollback también falla, se crea alerta crítica." },
+              { title: "[Job: notify] Crear issue según resultado", why: "if: always(). Un solo lugar. Cubre: exitoso, rollback auto exitoso, rollback auto falló." },
+            ],
+          },
+          {
+            id: "rollback-manual",
+            label: "rollback-manual.yml",
+            color: T.rollbackManual,
+            dim: T.rollbackManualDim,
+            icon: "🔙",
+            trigger: "workflow_dispatch (manual, desde la UI)",
+            runner: "self-hosted 🖥️ (solo tras aprobación)",
+            desc: "Rollback manual independiente. No comparte estado con otros workflows. Para emergencias o cuando el rollback automático falla.",
+            steps: [
+              { title: "[Job: validar] Verificar confirmación textual", why: "'CONFIRMO ROLLBACK' exacto. Un checkbox no es suficiente protección contra ejecuciones accidentales." },
+              { title: "[Job: validar] Checkout (fetch-depth: 0) + validar formato regex", why: "vX.Y.Z estricto. Sin historial completo no puede ver otros tags para la comparación." },
+              { title: "[Job: validar] Verificar que el tag existe en git", why: "Si no existe, muestra los últimos 10 tags disponibles para ayudar al operador." },
+              { title: "[Job: validar] Leer .deploy/current-production.json", why: "Fuente de verdad compartida. Si no existe el archivo, permite continuar con warning (el environment approval es el último filtro)." },
+              { title: "[Job: validar] Comparar versiones numéricamente", why: "Peso: Major×10⁶ + Minor×10³ + Patch. Verifica destino < actual. Previene forward-deploy disfrazado." },
+              { title: "[Job: ejecutar] PAUSA — environment: production", why: "El workflow se detiene aquí hasta aprobación. El self-hosted runner aún no está ocupado. El reviewer ve el resumen completo." },
+              { title: "[Job: ejecutar] Clean + Checkout exacto del tag destino", why: "El runner on-premise solo se activa DESPUÉS de la aprobación. Workspace limpio = estado determinista." },
+              { title: "[Job: ejecutar] Verificar checkout con git describe", why: "Doble verificación. En rollback manual, un error aquí puede desplegar la versión incorrecta." },
+              { title: "[Job: ejecutar] Build + Deploy (mismo mecanismo que deploy-production)", why: "Si uno usa docker-compose, el otro DEBE usar docker-compose. Consistencia es crítica." },
+              { title: "[Job: ejecutar] Health Check (10 reintentos × 15s)", why: "Si falla, el job falla y la notificación marca como CRÍTICO con acciones requeridas." },
+              { title: "[Job: ejecutar] Actualizar .deploy/current-production.json", why: "Mantiene la fuente de verdad en sync. El próximo rollback-manual leerá esta versión como 'actual'." },
+              { title: "[Job: notificar] Issue según resultado (exitoso / falló / abortado)", why: "if: always(). Cubre todos los estados incluyendo aborto en validación." },
+            ],
+          },
+        ];
+
+        // ─── COMPONENTES ──────────────────────────────────────────────────
+
+        function Badge({ color, children, small }) {
+          return (
+            <span style={{
+              display: "inline-block",
+              background: color + "18",
+              border: `1px solid ${color}40`,
+              color: color,
+              fontSize: small ? 9 : 10,
+              fontWeight: 700,
+              letterSpacing: "0.07em",
+              textTransform: "uppercase",
+              padding: small ? "1px 6px" : "2px 8px",
+              borderRadius: 4,
+            }}>{children}</span>
+          );
+        }
+
+        function Arrow({ color, label }) {
+          return (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, padding: "2px 0" }}>
+              {label && <span style={{ fontSize: 9, color: color, opacity: 0.7, letterSpacing: "0.04em" }}>{label}</span>}
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+                <path d="M10 2 L10 15" stroke={color} strokeWidth="1.8" strokeLinecap="round"/>
+                <path d="M5 11 L10 16 L15 11" stroke={color} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" fill="none"/>
+              </svg>
+            </div>
+          );
+        }
+
+        // ─── VISTA: ARQUITECTURA ──────────────────────────────────────────
+        function ArchitectureView() {
+          const wfBox = (wf, style = {}) => (
+            <div style={{
+              background: wf.dim,
+              border: `1px solid ${wf.color}35`,
+              borderRadius: 8,
+              padding: "10px 14px",
+              textAlign: "center",
+              minWidth: 130,
+              ...style,
+            }}>
+              <div style={{ fontSize: 18, marginBottom: 2 }}>{wf.icon}</div>
+              <div style={{ color: wf.color, fontSize: 11, fontWeight: 700 }}>{wf.label}</div>
+              <div style={{ color: T.textDim, fontSize: 9, marginTop: 2 }}>{wf.runner}</div>
+            </div>
+          );
+
+          const release = WORKFLOWS[0];
+          const schedule = WORKFLOWS[1];
+          const deploy = WORKFLOWS[2];
+          const rollbackManual = WORKFLOWS[3];
+
+          return (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 0 }}>
+              <div style={{ color: T.textDim, fontSize: 10, marginBottom: 6, letterSpacing: "0.06em", textTransform: "uppercase" }}>
+                Flujo principal (automático)
+              </div>
+
+              <div style={{
+                background: T.surfaceHi,
+                border: `1px solid ${T.borderHi}`,
+                borderRadius: 6,
+                padding: "6px 14px",
+                color: T.textBright,
+                fontSize: 11,
+                fontWeight: 600,
+              }}>
+                📥 PR merge → <code style={{ color: T.release }}>main</code>
+              </div>
+              <Arrow color={T.release} />
+
+              {wfBox(release)}
+              <Arrow color={T.schedule} label="crea tag" />
+
+              {wfBox(schedule)}
+              <Arrow color={T.deploy} label="hora alcanzada → dispara" />
+
+              {wfBox(deploy)}
+
+              <div style={{ display: "flex", gap: 0, marginTop: 4, position: "relative", width: "100%", maxWidth: 380, justifyContent: "center" }}>
+                <div style={{ position: "absolute", top: 14, left: "25%", right: "25%", height: 1, background: T.borderHi }} />
+
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", flex: 1 }}>
+                  <Arrow color={T.ok} />
+                  <div style={{
+                    background: T.okDim,
+                    border: `1px solid ${T.ok}40`,
+                    borderRadius: 6,
+                    padding: "5px 12px",
+                    color: T.ok,
+                    fontSize: 10,
+                    fontWeight: 600,
+                  }}>✅ Deploy exitoso</div>
+                </div>
+
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", flex: 1 }}>
+                  <Arrow color={T.fail} />
+                  <div style={{
+                    background: T.failDim,
+                    border: `1px solid ${T.fail}40`,
+                    borderRadius: 6,
+                    padding: "5px 12px",
+                    color: T.fail,
+                    fontSize: 10,
+                    fontWeight: 600,
+                  }}>❌ Health check falló</div>
+                  <Arrow color={T.rollbackAuto} />
+                  <div style={{
+                    background: T.rollbackAutoDim,
+                    border: `1px solid ${T.rollbackAuto}40`,
+                    borderRadius: 6,
+                    padding: "6px 10px",
+                    textAlign: "center",
+                  }}>
+                    <div style={{ fontSize: 13 }}>🔄</div>
+                    <div style={{ color: T.rollbackAuto, fontSize: 10, fontWeight: 700 }}>Rollback AUTO</div>
+                    <div style={{ color: T.textDim, fontSize: 8 }}>(dentro de deploy-production)</div>
+                  </div>
+
+                  <div style={{ display: "flex", gap: 16, marginTop: 4 }}>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                      <Arrow color={T.ok} />
+                      <div style={{
+                        background: T.okDim,
+                        border: `1px solid ${T.ok}40`,
+                        borderRadius: 5,
+                        padding: "3px 8px",
+                        color: T.ok,
+                        fontSize: 9,
+                        fontWeight: 600,
+                      }}>✅ Rollback OK</div>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                      <Arrow color={T.critical} />
+                      <div style={{
+                        background: T.criticalDim,
+                        border: `1px solid ${T.critical}50`,
+                        borderRadius: 5,
+                        padding: "3px 8px",
+                        color: T.critical,
+                        fontSize: 9,
+                        fontWeight: 700,
+                      }}>🚨 Alerta crítica</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{
+                marginTop: 20,
+                width: "100%",
+                maxWidth: 380,
+                borderTop: `1px dashed ${T.rollbackManual}40`,
+                paddingTop: 14,
+              }}>
+                <div style={{ color: T.textDim, fontSize: 9, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 8, textAlign: "center" }}>
+                  Rama independiente (intervención humana)
+                </div>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
+                  <div style={{
+                    background: T.criticalDim,
+                    border: `1px solid ${T.critical}40`,
+                    borderRadius: 5,
+                    padding: "3px 10px",
+                    color: T.critical,
+                    fontSize: 9,
+                    fontWeight: 600,
+                  }}>🚨 Rollback auto falló</div>
+                  <svg width="28" height="16" viewBox="0 0 28 16" fill="none">
+                    <path d="M2 8 L22 8" stroke={T.rollbackManual} strokeWidth="1.5" strokeDasharray="4 3"/>
+                    <path d="M18 4 L24 8 L18 12" stroke={T.rollbackManual} strokeWidth="1.5" fill="none" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                  {wfBox(rollbackManual, { minWidth: 140 })}
+                </div>
+                <div style={{ color: T.textDim, fontSize: 9, textAlign: "center", marginTop: 6 }}>
+                  También se puede disparar manualmente en cualquier momento (emergencias, bugs post-deploy)
+                </div>
+              </div>
+            </div>
+          );
+        }
+
+        // ─── VISTA: WORKFLOWS ─────────────────────────────────────────────
+        function WorkflowDetail({ wf }) {
+          const [expandedStep, setExpandedStep] = useState(null);
+
+          return (
+            <div style={{ width: "100%" }}>
+              <div style={{
+                background: wf.dim,
+                border: `1px solid ${wf.color}40`,
+                borderRadius: 8,
+                padding: "10px 14px",
+                marginBottom: 10,
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                  <span style={{ fontSize: 18 }}>{wf.icon}</span>
+                  <span style={{ color: wf.color, fontSize: 14, fontWeight: 700 }}>{wf.label}</span>
+                </div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 6 }}>
+                  <Badge color={wf.color} small>trigger: {wf.trigger}</Badge>
+                  <Badge color={T.text} small>runner: {wf.runner}</Badge>
+                </div>
+                <div style={{ color: T.text, fontSize: 11, lineHeight: 1.5 }}>{wf.desc}</div>
+              </div>
+
+              {wf.steps.map((step, i) => {
+                const isOpen = expandedStep === i;
+                const jobMatch = step.title.match(/^\[Job: (.+?)\]/);
+                const jobName = jobMatch ? jobMatch[1] : null;
+                const prevJobMatch = i > 0 ? wf.steps[i - 1].title.match(/^\[Job: (.+?)\]/) : null;
+                const prevJobName = prevJobMatch ? prevJobMatch[1] : null;
+                const newJob = jobName && jobName !== prevJobName;
+
+                return (
+                  <div key={i}>
+                    {newJob && (
+                      <div style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        margin: i === 0 ? "0 0 6px" : "10px 0 6px",
+                      }}>
+                        <div style={{ flex: 1, height: 1, background: T.border }} />
+                        <Badge color={wf.color} small>Job: {jobName}</Badge>
+                        <div style={{ flex: 1, height: 1, background: T.border }} />
+                      </div>
+                    )}
+
+                    <div
+                      onClick={() => setExpandedStep(isOpen ? null : i)}
+                      style={{
+                        background: isOpen ? T.surfaceHi : T.surface,
+                        border: `1px solid ${isOpen ? wf.color + "40" : T.border}`,
+                        borderRadius: 6,
+                        marginBottom: 4,
+                        cursor: "pointer",
+                        overflow: "hidden",
+                        transition: "border-color 0.15s",
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px" }}>
+                        <div style={{
+                          width: 20,
+                          height: 20,
+                          borderRadius: "50%",
+                          background: wf.color + "20",
+                          border: `1px solid ${wf.color}50`,
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          color: wf.color,
+                          fontSize: 10,
+                          fontWeight: 700,
+                          flexShrink: 0,
+                        }}>{i + 1}</div>
+                        <span style={{ color: T.textBright, fontSize: 11, flex: 1 }}>{step.title}</span>
+                        <span style={{ color: T.textDim, fontSize: 10 }}>{isOpen ? "▲" : "▼"}</span>
+                      </div>
+
+                      {isOpen && (
+                        <div style={{
+                          padding: "0 10px 8px 38px",
+                          borderTop: `1px solid ${T.border}`,
+                          paddingTop: 8,
+                        }}>
+                          <div style={{
+                            background: wf.color + "0a",
+                            borderLeft: `2px solid ${wf.color}`,
+                            borderRadius: "0 4px 4px 0",
+                            padding: "6px 10px",
+                          }}>
+                            <span style={{ color: wf.color, fontSize: 9, fontWeight: 700 }}>¿POR QUÉ? </span>
+                            <span style={{ color: T.text, fontSize: 11 }}>{step.why}</span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          );
+        }
+
+        // ─── COMPONENTE PRINCIPAL ─────────────────────────────────────────
+        function DeploymentPlan() {
+          const TABS = ["Arquitectura", "Workflows"];
+          const [activeTab, setActiveTab] = useState("Arquitectura");
+          const [activeWorkflow, setActiveWorkflow] = useState(0);
+
+          return (
+            <div style={{
+              background: T.bg,
+              minHeight: "100vh",
+              color: T.text,
+              fontFamily: "'SF Mono', 'Fira Code', 'Consolas', monospace",
+              padding: "24px 12px 40px",
+            }}>
+              <div style={{ maxWidth: 580, margin: "0 auto" }}>
+                <div style={{ textAlign: "center", marginBottom: 6 }}>
+                  <h1 style={{ color: T.textBright, fontSize: 18, fontWeight: 700, margin: 0, letterSpacing: "-0.02em" }}>
+                    🏗️ Plan de Despliegue a Producción
+                  </h1>
+                  <p style={{ color: T.textDim, fontSize: 10, margin: "4px 0 0" }}>
+                    GitHub Actions · Environments · Self-hosted runners · 4 workflows
+                  </p>
+                </div>
+
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, justifyContent: "center", marginBottom: 16 }}>
+                  {WORKFLOWS.map(wf => (
+                    <div key={wf.id} style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 5,
+                      background: wf.dim,
+                      border: `1px solid ${wf.color}35`,
+                      borderRadius: 5,
+                      padding: "3px 8px",
+                      cursor: "pointer",
+                    }} onClick={() => { setActiveTab("Workflows"); setActiveWorkflow(WORKFLOWS.indexOf(wf)); }}>
+                      <span style={{ fontSize: 11 }}>{wf.icon}</span>
+                      <span style={{ color: wf.color, fontSize: 9, fontWeight: 700 }}>{wf.label}</span>
+                    </div>
+                  ))}
+                </div>
+
+                <div style={{
+                  display: "flex",
+                  gap: 2,
+                  background: T.surface,
+                  borderRadius: 8,
+                  padding: 3,
+                  marginBottom: 16,
+                  border: `1px solid ${T.border}`,
+                }}>
+                  {TABS.map(tab => {
+                    const isActive = activeTab === tab;
+                    return (
+                      <button
+                        key={tab}
+                        onClick={() => setActiveTab(tab)}
+                        style={{
+                          flex: 1,
+                          background: isActive ? T.surfaceHi : "transparent",
+                          border: isActive ? `1px solid ${T.borderHi}` : "1px solid transparent",
+                          borderRadius: 6,
+                          color: isActive ? T.textBright : T.textDim,
+                          fontSize: 10,
+                          fontWeight: isActive ? 600 : 400,
+                          padding: "5px 4px",
+                          cursor: "pointer",
+                          transition: "all 0.15s",
+                          fontFamily: "inherit",
+                        }}
+                      >{tab}</button>
+                    );
+                  })}
+                </div>
+
+                {activeTab === "Arquitectura" && <ArchitectureView />}
+
+                {activeTab === "Workflows" && (
+                  <div>
+                    <div style={{ display: "flex", gap: 4, marginBottom: 12, flexWrap: "wrap" }}>
+                      {WORKFLOWS.map((wf, i) => {
+                        const isActive = activeWorkflow === i;
+                        return (
+                          <button
+                            key={wf.id}
+                            onClick={() => setActiveWorkflow(i)}
+                            style={{
+                              background: isActive ? wf.dim : T.surface,
+                              border: `1px solid ${isActive ? wf.color + "50" : T.border}`,
+                              borderRadius: 6,
+                              color: isActive ? wf.color : T.textDim,
+                              fontSize: 10,
+                              fontWeight: isActive ? 700 : 400,
+                              padding: "4px 10px",
+                              cursor: "pointer",
+                              fontFamily: "inherit",
+                            }}
+                          >{wf.icon} {wf.label}</button>
+                        );
+                      })}
+                    </div>
+                    <WorkflowDetail wf={WORKFLOWS[activeWorkflow]} />
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        }
+
+        // ─── RENDER ───────────────────────────────────────────────────────
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<DeploymentPlan />);
+    </script>
+</body>
+</html>
