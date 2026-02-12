@@ -1,0 +1,343 @@
+# ================================================================
+# .github/workflows/deploy-production.yml
+# ================================================================
+# WORKFLOW 3 / 4
+#
+# RESPONSABILIDAD: Deploy real a producción.
+#
+# TRIGGERS:
+#   workflow_dispatch → llamado por deploy-schedule.yml via API,
+#                       o manualmente por un admin
+#
+# RUNNER:
+#   Job 'validar'  → github-hosted (validaciones baratas, sin usar self-hosted)
+#   Job 'deploy'   → self-hosted    (el único que toca infraestructura)
+#   Job 'notificar'→ github-hosted  (solo escribe un issue)
+#
+# COMUNICACIÓN CON OTROS WORKFLOWS:
+#   ← Recibe tag desde deploy-schedule (o desde dispatch manual)
+#   → Escribe .deploy/current-production.json tras deploy exitoso
+#      (lo lee rollback-manual.yml para saber qué versión está activa)
+#
+# ROLLBACK:
+#   Este workflow NO tiene rollback automático.
+#   Si el deploy falla, usar rollback-manual.yml (workflow 4).
+# ================================================================
+
+name: "Deploy - Production"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag a desplegar (ej: v2.4.0)'
+        required: true
+        type: string
+      typeapp:
+        description: 'Tipo de aplicación a desplegar'
+        required: false
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - frontend
+          - backend
+      triggered_by:
+        description: 'Quién disparó esto (schedule/manual)'
+        required: false
+        default: 'manual'
+        type: string
+
+permissions:
+  contents: write      # Para escribir current-production.json
+  issues: write        # Para crear issues de notificación
+  deployments: write   # Para registrar deployments en GitHub
+
+# ================================================================
+# JOB 1: VALIDACIÓN
+# ================================================================
+# Corre en github-hosted. Valida inputs antes de ocupar el
+# runner self-hosted. Si falla, el runner on-premise nunca se toca.
+# ================================================================
+jobs:
+  validar:
+    name: "Validaciones pre-deploy"
+    runs-on: ubuntu-latest
+
+    outputs:
+      tag_validado: ${{ steps.validar-tag.outputs.tag_validado }}
+
+    steps:
+      - name: "Checkout con historial completo"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ─── Validar formato del tag ──────────────────────────
+      - name: "Validar formato del tag"
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if ! echo "${TAG}" | grep -qP '^v\d+\.\d+\.\d+$'; then
+            echo "❌ Tag inválido: '${TAG}'"
+            echo "   Formato requerido: vX.Y.Z (ejemplo: v2.4.0)"
+            exit 1
+          fi
+          echo "✅ Formato válido: ${TAG}"
+
+      # ─── Validar existencia del tag ───────────────────────
+      - name: "Verificar que el tag existe en git"
+        id: validar-tag
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if git rev-parse --verify "refs/tags/${TAG}" > /dev/null 2>&1; then
+            echo "✅ Tag existe: $(git rev-parse refs/tags/${TAG})"
+            echo "tag_validado=${TAG}" >> $GITHUB_OUTPUT
+          else
+            echo "❌ El tag ${TAG} no existe en el repositorio."
+            exit 1
+          fi
+
+  # ================================================================
+  # JOB 2: DEPLOY
+  # ================================================================
+  # El único job que corre en self-hosted. Es el que hace el
+  # trabajo real: checkout del tag, build, deploy, health check.
+  #
+  # environment: production activa la aprobación obligatoria
+  # configurada en GitHub Environments.
+  # ================================================================
+  deploy:
+    name: "Deploy a producción"
+    needs: validar
+    runs-on: self-hosted
+    environment: production
+    timeout-minutes: 30   # Si tarda más de 30min, falla automáticamente
+
+    steps:
+      # ─── Clean workspace ──────────────────────────────────
+      # Obligatorio en self-hosted. Sin esto, estado de
+      # ejecuciones anteriores puede contaminar el deploy.
+      - name: "Limpiar workspace del runner"
+        run: |
+          rm -rf ${GITHUB_WORKSPACE}/*
+          rm -rf ${GITHUB_WORKSPACE}/.git
+          echo "✅ Workspace limpio."
+
+      # ─── Checkout exacto del tag ──────────────────────────
+      # ref apunta exactamente al tag → detached HEAD.
+      # Determinista: siempre el mismo código para el mismo tag.
+      - name: "Checkout del tag objetivo"
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ─── Verificar checkout ───────────────────────────────
+      # Nunca asumas que checkout funcionó. En producción crítica,
+      # este check puede evitar un desastre.
+      - name: "Verificar integridad del checkout"
+        run: |
+          TAG_ESPERADO="${{ github.event.inputs.tag }}"
+          TAG_ACTUAL=$(git describe --exact-match --tags HEAD 2>/dev/null || echo "NONE")
+
+          if [ "${TAG_ACTUAL}" != "${TAG_ESPERADO}" ]; then
+            echo "❌ ERROR CRÍTICO: Esperado ${TAG_ESPERADO}, actual ${TAG_ACTUAL}"
+            exit 1
+          fi
+          echo "✅ Checkout verificado: ${TAG_ACTUAL} (SHA: $(git rev-parse HEAD))"
+
+      # ─── Build ────────────────────────────────────────────
+      # REEMPLAZAR con los comandos de build reales del proyecto.
+      # Es CRÍTICO que sea exactamente el mismo mecanismo que usa
+      # el rollback manual.
+      # El typeapp determina qué se buildea: frontend, backend o ambos.
+      - name: "Build de la aplicación"
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          TYPEAPP="${{ github.event.inputs.typeapp }}"
+          echo "🔨 Building versión ${TAG} (typeapp: ${TYPEAPP})..."
+
+          # ═══ REEMPLAZAR CON EL BUILD REAL ═══
+          case "${TYPEAPP}" in
+            frontend)
+              echo "📦 Building frontend..."
+              # cd frontend && npm ci && npm run build
+              ;;
+            backend)
+              echo "📦 Building backend..."
+              # cd backend && npm ci && npm run build
+              ;;
+            both)
+              echo "📦 Building frontend..."
+              # cd frontend && npm ci && npm run build
+              echo "📦 Building backend..."
+              # cd backend && npm ci && npm run build
+              ;;
+          esac
+          # ════════════════════════════════════
+
+          echo "✅ Build completado para ${TYPEAPP}."
+
+      # ─── Deploy ───────────────────────────────────────────
+      # El deploy real. DEBE usar exactamente el mismo mecanismo
+      # que el rollback. Si uno usa docker-compose, todos deben
+      # usar docker-compose.
+      # El typeapp determina qué se despliega: frontend, backend o ambos.
+      - name: "Ejecutar deploy a producción"
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          TYPEAPP="${{ github.event.inputs.typeapp }}"
+          echo "🚀 Desplegando ${TAG} a producción (typeapp: ${TYPEAPP})..."
+
+          # ═══ REEMPLAZAR CON EL DEPLOY REAL ═══
+          case "${TYPEAPP}" in
+            frontend)
+              echo "🌐 Desplegando frontend..."
+              # docker-compose -f docker-compose.prod.yml up -d frontend
+              ;;
+            backend)
+              echo "⚙️ Desplegando backend..."
+              # docker-compose -f docker-compose.prod.yml up -d backend
+              ;;
+            both)
+              echo "🌐 Desplegando frontend..."
+              # docker-compose -f docker-compose.prod.yml up -d frontend
+              echo "⚙️ Desplegando backend..."
+              # docker-compose -f docker-compose.prod.yml up -d backend
+              ;;
+          esac
+          # ═════════════════════════════════════
+
+          echo "✅ Deploy ejecutado para ${TYPEAPP}."
+
+      # ─── Health Check ─────────────────────────────────────
+      # El deploy no es "exitoso" hasta que la app responde.
+      # Sin health check es un deploy ciego.
+      # 10 reintentos × 15s = ~2.5 minutos de espera máximo.
+      - name: "Health check post-deploy"
+        id: health-check
+        run: |
+          HEALTH_URL="${{ secrets.DEPLOY_HEALTH_CHECK_URL }}"
+          TAG="${{ github.event.inputs.tag }}"
+          MAX_REINTENTOS=10
+          ESPERA=15
+
+          echo "🏥 Iniciando health check para ${TAG}..."
+
+          for i in $(seq 1 ${MAX_REINTENTOS}); do
+            echo "  Intento ${i}/${MAX_REINTENTOS}..."
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${HEALTH_URL}" 2>/dev/null || echo "000")
+            echo "  HTTP: ${HTTP_CODE}"
+
+            if [ "${HTTP_CODE}" = "200" ]; then
+              echo "✅ Health check exitoso. ${TAG} está activo."
+              exit 0
+            fi
+
+            [ "${i}" -lt "${MAX_REINTENTOS}" ] && sleep ${ESPERA}
+          done
+
+          echo "❌ Health check falló después de ${MAX_REINTENTOS} intentos."
+          echo "   Se requiere intervención manual. Usar rollback-manual.yml"
+          exit 1
+
+      # ─── Actualizar registro de versión activa ────────────
+      # Solo se ejecuta si el health check pasó (los steps anteriores
+      # no fallaron). Este archivo es la fuente de verdad que lee
+      # rollback-manual.yml para comparar versiones.
+      - name: "Actualizar .deploy/current-production.json"
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          TYPEAPP="${{ github.event.inputs.typeapp }}"
+
+          python3 << PYEOF
+import json
+from datetime import datetime, timezone
+
+data = {
+    "tag": "${TAG}",
+    "typeapp": "${TYPEAPP}",
+    "deployed_at": datetime.now(timezone.utc).isoformat(),
+    "deployed_by": "${{ github.actor }}",
+    "method": "deploy",
+    "workflow_run_id": "${{ github.run_id }}",
+    "triggered_by": "${{ github.event.inputs.triggered_by }}"
+}
+
+with open(".deploy/current-production.json", "w") as f:
+    json.dump(data, f, indent=2)
+
+print(json.dumps(data, indent=2))
+PYEOF
+
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "GitHub Actions Bot"
+          git add .deploy/current-production.json
+          git commit -m "chore: producción actualizada a ${TAG} [no-release]" || true
+          git push origin main || true
+
+  # ================================================================
+  # JOB 3: NOTIFICACIÓN
+  # ================================================================
+  # Siempre corre (if: always()). Centraliza todas las
+  # notificaciones del deploy en un solo lugar.
+  # ================================================================
+  notificar:
+    name: "Notificación del resultado"
+    needs: [deploy]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Crear issue de notificación"
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag          = '${{ github.event.inputs.tag }}';
+            const typeapp      = '${{ github.event.inputs.typeapp }}';
+            const deployResult = '${{ needs.deploy.result }}';
+            const actor        = '${{ github.actor }}';
+            const runUrl       = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
+
+            let title, body, labels;
+
+            if (deployResult === 'success') {
+              // ── Deploy exitoso ──
+              title  = `✅ Deploy exitoso a producción: ${tag} (${typeapp})`;
+              body   = `El deploy de \`${tag}\` fue completado exitosamente.\n\n` +
+                       `| Campo | Valor |\n|---|---|\n` +
+                       `| **Tag** | \`${tag}\` |\n` +
+                       `| **Typeapp** | \`${typeapp}\` |\n` +
+                       `| **Ejecutado por** | @${actor} |\n` +
+                       `| **Workflow run** | [Ver logs](${runUrl}) |\n`;
+              labels = ['deploy', 'exitoso'];
+
+            } else {
+              // ── Deploy falló ──
+              title  = `❌ Deploy falló: ${tag} (${typeapp})`;
+              body   = `El deploy de \`${tag}\` falló.\n\n` +
+                       `**Se requiere intervención manual.**\n\n` +
+                       `| Campo | Valor |\n|---|---|\n` +
+                       `| **Tag intentado** | \`${tag}\` |\n` +
+                       `| **Typeapp** | \`${typeapp}\` |\n` +
+                       `| **Ejecutado por** | @${actor} |\n` +
+                       `| **Workflow run** | [Ver logs](${runUrl}) |\n\n` +
+                       `### Acciones requeridas\n` +
+                       `- [ ] Revisar los logs del workflow (link arriba)\n` +
+                       `- [ ] Usar **rollback-manual.yml** para restaurar una versión estable\n` +
+                       `- [ ] Investigar el problema en \`${tag}\`\n`;
+              labels = ['deploy', 'fallo', 'intervención-manual'];
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: labels
+            });
+
+            console.log('Issue creado: ' + title);
