@@ -1,0 +1,132 @@
+# ================================================================
+# .github/workflows/sync-alert.yml
+# ================================================================
+# WORKFLOW 8 / 8
+#
+# RESPONSABILIDAD: Detectar si main-promocion-pro esta adelantada
+# a main por mas de 2 horas tras un deploy exitoso.
+#
+# Esto puede indicar:
+#   - La PR no fue mergeada manualmente tras deploy exitoso
+#   - Un deploy fallo y nadie hizo rollback
+#   - El merge manual fue olvidado
+#
+# TRIGGER:
+#   schedule → cron cada hora
+#
+# RUNNER: github-hosted
+# ================================================================
+
+name: "Sync Alert - Desync Detection"
+
+on:
+  schedule:
+    - cron: '0 * * * *'    # Cada hora
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-desync:
+    name: "Verificar sincronizacion"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "Detectar desincronizacion"
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { execSync } = require('child_process');
+
+            // Contar commits que main-promocion-pro tiene y main no
+            let ahead;
+            try {
+              ahead = parseInt(
+                execSync('git rev-list --count origin/main..origin/main-promocion-pro')
+                  .toString().trim()
+              );
+            } catch (e) {
+              console.log('No se pudo comparar ramas. Puede que main-promocion-pro no exista.');
+              return;
+            }
+
+            if (ahead === 0) {
+              console.log('main-promocion-pro y main estan sincronizadas. Todo OK.');
+              return;
+            }
+
+            console.log(`main-promocion-pro esta ${ahead} commits adelante de main.`);
+
+            // Verificar cuando fue el ultimo deploy exitoso
+            const deployments = await github.rest.repos.listDeployments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              environment: 'production',
+              per_page: 1
+            });
+
+            if (deployments.data.length === 0) {
+              console.log('No hay deployments registrados. Saltando.');
+              return;
+            }
+
+            const deployedAt = new Date(deployments.data[0].created_at);
+            const hoursAgo = (Date.now() - deployedAt.getTime()) / (1000 * 60 * 60);
+
+            console.log(`Ultimo deploy: hace ${Math.round(hoursAgo * 10) / 10} horas`);
+
+            if (hoursAgo <= 2) {
+              console.log('Ultimo deploy fue hace menos de 2h. Puede estar en proceso. OK.');
+              return;
+            }
+
+            // Verificar si ya hay un issue abierto de desync para no duplicar
+            const existingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'desync-alert',
+              state: 'open'
+            });
+
+            if (existingIssues.data.length > 0) {
+              console.log(`Ya existe issue de desync abierto: #${existingIssues.data[0].number}`);
+              console.log('No se creara duplicado.');
+              return;
+            }
+
+            // Crear issue de alerta
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `ALERTA: main-promocion-pro ${ahead} commits adelante de main (>${Math.round(hoursAgo)}h)`,
+              body: [
+                '## Desincronizacion detectada',
+                '',
+                `\`main-promocion-pro\` tiene **${ahead} commits** que \`main\` no tiene,`,
+                `y han pasado **${Math.round(hoursAgo)} horas** desde el ultimo deploy a produccion.`,
+                '',
+                '### Posibles causas',
+                '- La PR de `main-promocion-pro` -> `main` no fue mergeada manualmente tras deploy exitoso',
+                '- El deploy a produccion fallo y nadie hizo rollback',
+                '- El merge manual fue olvidado (revisar label `ready-to-merge`)',
+                '',
+                '### Accion requerida',
+                '- [ ] Verificar estado de produccion',
+                '- [ ] Revisar si hay PR abierta de `main-promocion-pro` -> `main`',
+                '- [ ] Resolver conflicto manualmente si lo hay',
+                '- [ ] Cerrar este issue cuando se resuelva',
+                '',
+                '---',
+                `*Detectado automaticamente por sync-alert.yml a las ${new Date().toISOString()}*`
+              ].join('\n'),
+              labels: ['desync-alert']
+            });
+
+            console.log(`Issue de desync creado: #${issue.data.number}`);

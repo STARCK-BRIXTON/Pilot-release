@@ -1,0 +1,19 @@
+# ================================================================
+# CODEOWNERS
+# ================================================================
+# Define quien debe revisar cambios en areas criticas del repo.
+# Cualquier PR que toque estos archivos requerira aprobacion
+# de los equipos listados.
+#
+# Formato: <patron> <owner1> <owner2> ...
+# Documentacion: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+# ================================================================
+
+# Workflows de GitHub Actions — solo el equipo DevOps puede modificar
+/.github/workflows/    @STARCK-BRIXTON/devops-team
+
+# Composite actions — solo el equipo DevOps
+/.github/actions/      @STARCK-BRIXTON/devops-team
+
+# Configuracion de CODEOWNERS — requiere admin
+/.github/CODEOWNERS    @STARCK-BRIXTON/admin-team

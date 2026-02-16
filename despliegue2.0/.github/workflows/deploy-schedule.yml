@@ -1,0 +1,249 @@
+# ================================================================
+# .github/workflows/deploy-schedule.yml
+# ================================================================
+# WORKFLOW 5 / 8
+#
+# RESPONSABILIDAD UNICA: Vigilar si es momento de desplegar.
+# Es el "reloj" del sistema. No hace deploy el mismo.
+#
+# TRIGGER:
+#   schedule → cron cada 5 minutos
+#   workflow_dispatch → fallback manual de emergencia
+#
+# RUNNER: github-hosted
+#
+# COMUNICACION CON OTROS WORKFLOWS:
+#   ← Lee deploy-schedule/vX.Y.Z.json desde rama deploy-state
+#   → Dispara deploy-production.yml via GitHub API
+#   → Actualiza estado del schedule en rama deploy-state
+#
+# SEGURIDAD:
+#   - Inputs via env: blocks
+#   - JS via process.env
+#   - Concurrency group para evitar ejecuciones paralelas
+#   - Python consolidado (1 script vs 4 llamadas separadas)
+#   - Sin commits a main
+#
+# CAMBIOS VS 2-deploy-schedule.yml ORIGINAL:
+#   - Checkout: main → deploy-state
+#   - JSON scan: 4x python3 -c → 1 script Python consolidado
+#   - Push estado: main → deploy-state
+#   - Dispatch ref: main → main-promocion-pro
+#   - Inputs: interpolacion directa → env: blocks
+#   - JS: '${{ }}' → process.env.*
+# ================================================================
+
+name: "Deploy Schedule - Monitor & Trigger"
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+
+  workflow_dispatch:
+    inputs:
+      force_tag:
+        description: 'Tag a desplegar inmediatamente (ej: v2.4.0). Vacio = modo cron.'
+        required: false
+        type: string
+      force_typeapp:
+        description: 'Tipo de aplicacion a desplegar'
+        required: false
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - frontend
+          - backend
+
+concurrency:
+  group: deploy-schedule
+  cancel-in-progress: false
+
+permissions:
+  contents: write    # Para actualizar estado en deploy-state
+  actions: write     # Para disparar otro workflow
+
+jobs:
+  check-schedule:
+    name: "Verificar schedules"
+    runs-on: ubuntu-latest
+
+    steps:
+      # ─── Checkout de rama deploy-state ────────────────────
+      - name: "Checkout deploy-state"
+        uses: actions/checkout@v4
+        with:
+          ref: deploy-state
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ─── CASO 1: Dispatch manual con tag forzado ──────────
+      - name: "Manejar dispatch manual"
+        id: check-manual
+        env:
+          FORCE_TAG: ${{ github.event.inputs.force_tag }}
+          FORCE_TYPEAPP: ${{ github.event.inputs.force_typeapp }}
+        run: |
+          if [ -n "${FORCE_TAG}" ]; then
+            echo "manual_trigger=true" >> $GITHUB_OUTPUT
+            echo "target_tag=${FORCE_TAG}" >> $GITHUB_OUTPUT
+            echo "target_typeapp=${FORCE_TYPEAPP:-both}" >> $GITHUB_OUTPUT
+            echo "Modo: dispatch manual - tag ${FORCE_TAG} (typeapp: ${FORCE_TYPEAPP:-both})"
+          else
+            echo "manual_trigger=false" >> $GITHUB_OUTPUT
+            echo "Modo: cron automatico"
+          fi
+
+      # ─── CASO 2: Cron automatico ─────────────────────────
+      # Python consolidado: 1 script que procesa todos los JSON
+      # en lugar de 4 llamadas python3 -c separadas por archivo.
+      - name: "Escanear schedules pendientes"
+        id: scan-schedule
+        if: steps.check-manual.outputs.manual_trigger == 'false'
+        run: |
+          python3 << 'PYEOF'
+          import json, os, time, glob
+
+          current_epoch = int(time.time())
+          found = False
+
+          schedule_files = sorted(glob.glob("deploy-schedule/*.json"))
+
+          if not schedule_files:
+              print("No hay archivos de schedule.")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+                  out.write("found_target=false\n")
+          else:
+              for filepath in schedule_files:
+                  try:
+                      with open(filepath) as f:
+                          data = json.load(f)
+                  except (json.JSONDecodeError, KeyError) as e:
+                      print(f"WARN: Error leyendo {filepath}: {e}")
+                      continue
+
+                  status = data.get("status", "")
+                  scheduled_epoch = data.get("scheduled_epoch_utc", 0)
+                  tag = data.get("tag", "")
+                  typeapp = data.get("typeapp", "both")
+
+                  if status == "pending" and current_epoch >= scheduled_epoch:
+                      with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+                          out.write(f"found_target=true\n")
+                          out.write(f"target_tag={tag}\n")
+                          out.write(f"target_typeapp={typeapp}\n")
+                      print(f"Schedule pendiente encontrado: {tag} ({typeapp})")
+                      found = True
+                      break
+
+              if not found:
+                  with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+                      out.write("found_target=false\n")
+                  print("No hay schedules pendientes cuya hora ya haya pasado.")
+          PYEOF
+
+      # ─── Validar que el tag existe en git ─────────────────
+      - name: "Validar existencia del tag"
+        id: validate-tag
+        if: >
+          steps.check-manual.outputs.manual_trigger == 'true' ||
+          steps.scan-schedule.outputs.found_target == 'true'
+        env:
+          MANUAL: ${{ steps.check-manual.outputs.manual_trigger }}
+          MANUAL_TAG: ${{ steps.check-manual.outputs.target_tag }}
+          MANUAL_TYPEAPP: ${{ steps.check-manual.outputs.target_typeapp }}
+          SCAN_TAG: ${{ steps.scan-schedule.outputs.target_tag }}
+          SCAN_TYPEAPP: ${{ steps.scan-schedule.outputs.target_typeapp }}
+        run: |
+          if [ "${MANUAL}" = "true" ]; then
+            TAG="${MANUAL_TAG}"
+            TYPEAPP="${MANUAL_TYPEAPP}"
+          else
+            TAG="${SCAN_TAG}"
+            TYPEAPP="${SCAN_TYPEAPP}"
+          fi
+
+          # Fetch tags desde el repo completo
+          git fetch origin --tags
+
+          if git rev-parse --verify "refs/tags/${TAG}" > /dev/null 2>&1; then
+            echo "Tag ${TAG} existe (typeapp: ${TYPEAPP})."
+            echo "tag_exists=true" >> $GITHUB_OUTPUT
+            echo "validated_tag=${TAG}" >> $GITHUB_OUTPUT
+            echo "validated_typeapp=${TYPEAPP}" >> $GITHUB_OUTPUT
+          else
+            echo "Tag ${TAG} NO existe aun."
+            echo "Puede ser timing entre merge y creacion de tag."
+            echo "El cron reintentara en ~5 minutos."
+            echo "tag_exists=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+      # ─── Disparar deploy-production.yml ───────────────────
+      - name: "Disparar deploy a produccion"
+        if: steps.validate-tag.outputs.tag_exists == 'true'
+        uses: actions/github-script@v7
+        env:
+          VALIDATED_TAG: ${{ steps.validate-tag.outputs.validated_tag }}
+          VALIDATED_TYPEAPP: ${{ steps.validate-tag.outputs.validated_typeapp }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag = process.env.VALIDATED_TAG;
+            const typeapp = process.env.VALIDATED_TYPEAPP;
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'deploy-production.yml',
+              ref: 'main-promocion-pro',
+              inputs: {
+                tag: tag,
+                typeapp: typeapp,
+                triggered_by: 'schedule'
+              }
+            });
+
+            console.log(`deploy-production.yml disparado: ${tag} (${typeapp})`);
+
+      # ─── Actualizar estado a "triggered" ──────────────────
+      - name: "Actualizar estado del schedule"
+        if: steps.validate-tag.outputs.tag_exists == 'true'
+        env:
+          TAG: ${{ steps.validate-tag.outputs.validated_tag }}
+        run: |
+          SCHEDULE_FILE="deploy-schedule/${TAG}.json"
+
+          if [ -f "${SCHEDULE_FILE}" ]; then
+            python3 << 'PYEOF'
+          import json, os
+          from datetime import datetime, timezone
+
+          tag = os.environ["TAG"]
+          filepath = f"deploy-schedule/{tag}.json"
+
+          with open(filepath, "r") as f:
+              data = json.load(f)
+
+          data["status"] = "triggered"
+          data["triggered_at"] = datetime.now(timezone.utc).isoformat()
+
+          with open(filepath, "w") as f:
+              json.dump(data, f, indent=2)
+
+          print(f"Schedule actualizado: {tag} -> triggered")
+          PYEOF
+
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git config user.name "GitHub Actions Bot"
+            git add "${SCHEDULE_FILE}"
+            git commit -m "triggered: ${TAG}"
+
+            # Push con retry
+            for i in 1 2 3; do
+              git push origin deploy-state && break
+              echo "Push fallo (intento $i/3). Reintentando..."
+              git pull --rebase origin deploy-state
+              sleep 2
+            done
+          fi

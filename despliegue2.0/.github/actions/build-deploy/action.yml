@@ -1,0 +1,171 @@
+# ================================================================
+# .github/actions/build-deploy/action.yml
+# ================================================================
+# COMPOSITE ACTION: Build, Deploy y Health Check
+#
+# Logica compartida entre deploy-production.yml y rollback-manual.yml.
+# Cambiar el proceso de build/deploy aqui afecta ambos workflows.
+#
+# SEGURIDAD:
+#   Todos los inputs se pasan como variables de entorno.
+#   No hay interpolacion directa de ${{ }} en contexto shell.
+# ================================================================
+
+name: "Build, Deploy y Health Check"
+description: "Logica compartida de build/deploy/health-check para deploy y rollback"
+
+inputs:
+  tag:
+    description: "Tag a desplegar"
+    required: true
+  typeapp:
+    description: "Tipo de aplicacion (frontend/backend/both)"
+    required: true
+    default: "both"
+  health_check_url:
+    description: "URL del health check"
+    required: true
+  max_retries:
+    description: "Intentos maximos de health check"
+    required: false
+    default: "10"
+  retry_interval:
+    description: "Segundos entre reintentos"
+    required: false
+    default: "15"
+
+outputs:
+  health_result:
+    description: "Resultado del health check (success/failure)"
+    value: ${{ steps.health-check.outputs.result }}
+
+runs:
+  using: "composite"
+  steps:
+    # ─── BUILD ─────────────────────────────────────────────
+    - name: "Build de la aplicacion"
+      shell: bash
+      env:
+        TAG: ${{ inputs.tag }}
+        TYPEAPP: ${{ inputs.typeapp }}
+      run: |
+        echo "============================================"
+        echo "  BUILD: ${TAG} (typeapp: ${TYPEAPP})"
+        echo "============================================"
+
+        # ═══ REEMPLAZAR CON BUILD REAL ═══
+        case "${TYPEAPP}" in
+          frontend)
+            echo "Building frontend..."
+            # cd frontend && npm ci && npm run build
+            ;;
+          backend)
+            echo "Building backend..."
+            # cd backend && npm ci && npm run build
+            ;;
+          both)
+            echo "Building frontend..."
+            # cd frontend && npm ci && npm run build
+            echo "Building backend..."
+            # cd backend && npm ci && npm run build
+            ;;
+          *)
+            echo "ERROR: TYPEAPP invalido: ${TYPEAPP}"
+            exit 1
+            ;;
+        esac
+        # ════════════════════════════════
+
+        echo "Build completado para ${TYPEAPP}."
+
+    # ─── DEPLOY ────────────────────────────────────────────
+    - name: "Deploy a produccion"
+      shell: bash
+      env:
+        TAG: ${{ inputs.tag }}
+        TYPEAPP: ${{ inputs.typeapp }}
+      run: |
+        echo "============================================"
+        echo "  DEPLOY: ${TAG} (typeapp: ${TYPEAPP})"
+        echo "============================================"
+
+        # ═══ REEMPLAZAR CON DEPLOY REAL ═══
+        case "${TYPEAPP}" in
+          frontend)
+            echo "Desplegando frontend..."
+            # docker-compose -f docker-compose.prod.yml up -d frontend
+            ;;
+          backend)
+            echo "Desplegando backend..."
+            # docker-compose -f docker-compose.prod.yml up -d backend
+            ;;
+          both)
+            echo "Desplegando frontend..."
+            # docker-compose -f docker-compose.prod.yml up -d frontend
+            echo "Desplegando backend..."
+            # docker-compose -f docker-compose.prod.yml up -d backend
+            ;;
+        esac
+        # ═══════════════════════════════════
+
+        echo "Deploy ejecutado para ${TYPEAPP}."
+
+    # ─── HEALTH CHECK ──────────────────────────────────────
+    # Verifica:
+    #   1. HTTP 200 (basico)
+    #   2. Version desplegada == tag esperado (si el endpoint lo soporta)
+    - name: "Health check post-deploy"
+      id: health-check
+      shell: bash
+      env:
+        HEALTH_URL: ${{ inputs.health_check_url }}
+        TAG: ${{ inputs.tag }}
+        MAX_RETRIES: ${{ inputs.max_retries }}
+        INTERVAL: ${{ inputs.retry_interval }}
+      run: |
+        echo "============================================"
+        echo "  HEALTH CHECK: ${TAG}"
+        echo "  URL: ${HEALTH_URL}"
+        echo "  Max reintentos: ${MAX_RETRIES}"
+        echo "  Intervalo: ${INTERVAL}s"
+        echo "============================================"
+
+        for i in $(seq 1 ${MAX_RETRIES}); do
+          echo "  Intento ${i}/${MAX_RETRIES}..."
+
+          HTTP_CODE=$(curl -s -o /tmp/health_response.json -w "%{http_code}" \
+            --max-time 10 "${HEALTH_URL}" 2>/dev/null || echo "000")
+
+          echo "  HTTP: ${HTTP_CODE}"
+
+          if [ "${HTTP_CODE}" = "200" ]; then
+            # Intentar verificar version desplegada (si el endpoint lo soporta)
+            DEPLOYED_VERSION=$(python3 -c "
+import json, sys
+try:
+    with open('/tmp/health_response.json') as f:
+        data = json.load(f)
+    print(data.get('version', ''))
+except:
+    print('')
+" 2>/dev/null || echo "")
+
+            if [ -n "${DEPLOYED_VERSION}" ] && [ "${DEPLOYED_VERSION}" != "${TAG}" ]; then
+              echo "  HTTP 200 pero version incorrecta: ${DEPLOYED_VERSION} (esperada: ${TAG})"
+              echo "  Puede ser cache o load balancer. Reintentando..."
+            else
+              if [ -n "${DEPLOYED_VERSION}" ]; then
+                echo "  Version verificada: ${DEPLOYED_VERSION}"
+              fi
+              echo "Health check exitoso. ${TAG} activo."
+              echo "result=success" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+
+          [ "${i}" -lt "${MAX_RETRIES}" ] && sleep ${INTERVAL}
+        done
+
+        echo "Health check fallo tras ${MAX_RETRIES} intentos."
+        echo "result=failure" >> $GITHUB_OUTPUT
+        exit 1

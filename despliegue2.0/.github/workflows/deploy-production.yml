@@ -1,0 +1,339 @@
+# ================================================================
+# .github/workflows/deploy-production.yml
+# ================================================================
+# WORKFLOW 6 / 8
+#
+# RESPONSABILIDAD: Deploy real a produccion.
+# Tras health check exitoso, marca la PR main-promocion-pro -> main
+# como lista para merge manual por el usuario.
+#
+# TRIGGER:
+#   workflow_dispatch → llamado por deploy-schedule.yml o manualmente
+#
+# RUNNER:
+#   Job 'validar'   → github-hosted (validaciones baratas)
+#   Job 'deploy'    → self-hosted    (toca infraestructura)
+#   Job 'notificar' → github-hosted  (solo crea issue)
+#
+# COMUNICACION CON OTROS WORKFLOWS:
+#   ← Recibe tag desde deploy-schedule (o dispatch manual)
+#   → Registra deployment via GitHub Deployments API
+#   → Marca PR main-promocion-pro -> main como lista para merge manual
+#   → Sync main -> develop (manual tras merge de la PR)
+#
+# SEGURIDAD:
+#   - Todos los inputs via env: blocks (shell) y process.env (JS)
+#   - Concurrency group compartido con rollback (exclusion mutua)
+#   - Sin commits de estado a main
+#   - Composite action para build/deploy/health-check
+#
+# CAMBIOS VS 3-deploy-production.yml ORIGINAL:
+#   - Checkout ref: main → main-promocion-pro / tag
+#   - Build/Deploy: inline duplicado → composite action
+#   - Estado: git push JSON a main → GitHub Deployments API
+#   - Post health-check: nada → marca PR lista + label ready-to-merge
+#   - Inputs shell: ${{ }} directo → env: blocks
+#   - Inputs JS: '${{ }}' → process.env.*
+#   - Concurrency: ninguna → group deploy-production
+# ================================================================
+
+name: "Deploy - Production"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag a desplegar (ej: v2.4.0)'
+        required: true
+        type: string
+      typeapp:
+        description: 'Tipo de aplicacion a desplegar'
+        required: false
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - frontend
+          - backend
+      triggered_by:
+        description: 'Quien disparo esto (schedule/manual)'
+        required: false
+        default: 'manual'
+        type: string
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false    # NUNCA cancelar un deploy en progreso
+
+permissions:
+  contents: write
+  issues: write
+  deployments: write
+  pull-requests: write
+
+# ================================================================
+# JOB 1: VALIDACION
+# ================================================================
+jobs:
+  validar:
+    name: "Validaciones pre-deploy"
+    runs-on: ubuntu-latest
+
+    outputs:
+      tag_validado: ${{ steps.validar-tag.outputs.tag_validado }}
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+        with:
+          ref: main-promocion-pro
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ─── Validar formato del tag ──────────────────────────
+      - name: "Validar formato del tag"
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if ! echo "${TAG}" | grep -qP '^v\d+\.\d+\.\d+$'; then
+            echo "Tag invalido: '${TAG}'"
+            echo "Formato requerido: vX.Y.Z (ejemplo: v2.4.0)"
+            exit 1
+          fi
+          echo "Formato valido: ${TAG}"
+
+      # ─── Validar existencia del tag ───────────────────────
+      - name: "Verificar que el tag existe"
+        id: validar-tag
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if git rev-parse --verify "refs/tags/${TAG}" > /dev/null 2>&1; then
+            echo "Tag existe: $(git rev-parse refs/tags/${TAG})"
+            echo "tag_validado=${TAG}" >> $GITHUB_OUTPUT
+          else
+            echo "El tag ${TAG} no existe en el repositorio."
+            echo "Tags disponibles (ultimos 10):"
+            git tag --sort=-version:refname | head -10
+            exit 1
+          fi
+
+  # ================================================================
+  # JOB 2: DEPLOY
+  # ================================================================
+  deploy:
+    name: "Deploy a produccion"
+    needs: validar
+    runs-on: self-hosted
+    environment: production
+    timeout-minutes: 30
+
+    steps:
+      # ─── Clean workspace (obligatorio en self-hosted) ─────
+      - name: "Limpiar workspace del runner"
+        run: |
+          rm -rf ${GITHUB_WORKSPACE}/*
+          rm -rf ${GITHUB_WORKSPACE}/.git
+          echo "Workspace limpio."
+
+      # ─── Checkout exacto del tag ──────────────────────────
+      - name: "Checkout del tag objetivo"
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ─── Verificar integridad del checkout ────────────────
+      - name: "Verificar integridad del checkout"
+        env:
+          TAG_ESPERADO: ${{ github.event.inputs.tag }}
+        run: |
+          TAG_ACTUAL=$(git describe --exact-match --tags HEAD 2>/dev/null || echo "NONE")
+
+          if [ "${TAG_ACTUAL}" != "${TAG_ESPERADO}" ]; then
+            echo "ERROR CRITICO: Esperado ${TAG_ESPERADO}, actual ${TAG_ACTUAL}"
+            exit 1
+          fi
+          echo "Checkout verificado: ${TAG_ACTUAL} (SHA: $(git rev-parse HEAD))"
+
+      # ─── Build + Deploy + Health Check (Composite Action) ─
+      - name: "Build, Deploy y Health Check"
+        id: build-deploy
+        uses: ./.github/actions/build-deploy
+        with:
+          tag: ${{ github.event.inputs.tag }}
+          typeapp: ${{ github.event.inputs.typeapp }}
+          health_check_url: ${{ secrets.DEPLOY_HEALTH_CHECK_URL }}
+
+      # ─── Registrar deployment via GitHub Deployments API ──
+      # Reemplaza el anterior git push de current-production.json
+      - name: "Registrar deployment exitoso"
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+          TYPEAPP: ${{ github.event.inputs.typeapp }}
+          TRIGGERED_BY: ${{ github.event.inputs.triggered_by }}
+          ACTOR: ${{ github.actor }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag = process.env.TAG;
+            const typeapp = process.env.TYPEAPP;
+            const triggeredBy = process.env.TRIGGERED_BY;
+            const actor = process.env.ACTOR;
+
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: tag,
+              environment: 'production',
+              auto_merge: false,
+              required_contexts: [],
+              payload: {
+                typeapp: typeapp,
+                triggered_by: triggeredBy,
+                deployed_by: actor
+              },
+              description: `Deploy ${tag} (${typeapp})`
+            });
+
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment.data.id,
+              state: 'success',
+              environment: 'production',
+              description: `Deploy ${tag} exitoso`
+            });
+
+            console.log(`Deployment registrado: ${tag} (${typeapp})`);
+
+      # ─── NOTIFICAR PR LISTA PARA MERGE MANUAL ───────────
+      # El health check paso → el codigo esta verificado en
+      # produccion → la PR queda lista para que el usuario
+      # la mergee manualmente cuando lo considere oportuno.
+      # NO se hace auto-merge. La decision es del usuario.
+      - name: "Marcar PR como lista para merge"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          echo "============================================"
+          echo "  PR LISTA PARA MERGE MANUAL"
+          echo "  Tag verificado en produccion: ${TAG}"
+          echo "============================================"
+
+          # Buscar PR abierta de main-promocion-pro -> main
+          PR_NUMBER=$(gh pr list \
+            --base main \
+            --head main-promocion-pro \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -n "${PR_NUMBER}" ]; then
+            # Agregar comentario indicando que el deploy fue exitoso
+            gh pr comment "${PR_NUMBER}" --body "## Deploy verificado en produccion
+
+          El tag \`${TAG}\` fue desplegado exitosamente y el health check paso.
+
+          **Esta PR esta lista para ser mergeada a main.**
+
+          > Merge manual requerido. Una vez mergeada, sincronizar main -> develop."
+
+            # Agregar label para visibilidad
+            gh pr edit "${PR_NUMBER}" --add-label "ready-to-merge" 2>/dev/null || true
+
+            echo "PR #${PR_NUMBER} marcada como lista para merge."
+            echo "El usuario debe mergear manualmente."
+          else
+            echo "WARN: No hay PR abierta de main-promocion-pro a main."
+            echo "Verificar que release.yml creo la PR correctamente."
+          fi
+
+  # ================================================================
+  # JOB 3: NOTIFICACION
+  # ================================================================
+  notificar:
+    name: "Notificacion"
+    needs: [deploy]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Crear issue de notificacion"
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+          TYPEAPP: ${{ github.event.inputs.typeapp }}
+          TRIGGERED_BY: ${{ github.event.inputs.triggered_by }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag = process.env.TAG;
+            const typeapp = process.env.TYPEAPP;
+            const triggeredBy = process.env.TRIGGERED_BY;
+            const result = process.env.DEPLOY_RESULT;
+            const actor = process.env.ACTOR;
+            const runUrl = process.env.RUN_URL;
+
+            let title, body, labels;
+
+            if (result === 'success') {
+              title = `Deploy exitoso: ${tag} (${typeapp})`;
+              body = [
+                `Deploy de \`${tag}\` completado exitosamente.`,
+                '',
+                '| Campo | Valor |',
+                '|---|---|',
+                `| **Tag** | \`${tag}\` |`,
+                `| **Typeapp** | \`${typeapp}\` |`,
+                `| **Disparado por** | ${triggeredBy} |`,
+                `| **Ejecutado por** | @${actor} |`,
+                `| **Logs** | [Ver workflow](${runUrl}) |`,
+                '',
+                '### Estado',
+                '- [x] Health check exitoso',
+                '- [x] Deployment registrado en GitHub API',
+                '- [x] PR main-promocion-pro -> main marcada como lista',
+                '',
+                '### Accion requerida',
+                '- [ ] Mergear PR de main-promocion-pro -> main manualmente',
+                '- [ ] Sincronizar main -> develop tras el merge'
+              ].join('\n');
+              labels = ['deploy', 'exitoso'];
+            } else {
+              title = `Deploy FALLO: ${tag} (${typeapp})`;
+              body = [
+                `Deploy de \`${tag}\` fallo.`,
+                '',
+                '**main NO fue afectada.** main-promocion-pro actuo como buffer.',
+                '',
+                '| Campo | Valor |',
+                '|---|---|',
+                `| **Tag intentado** | \`${tag}\` |`,
+                `| **Typeapp** | \`${typeapp}\` |`,
+                `| **Disparado por** | ${triggeredBy} |`,
+                `| **Ejecutado por** | @${actor} |`,
+                `| **Logs** | [Ver workflow](${runUrl}) |`,
+                '',
+                '### Acciones requeridas',
+                '- [ ] Revisar los logs del workflow',
+                '- [ ] Usar **rollback-manual.yml** si es necesario',
+                '- [ ] Corregir el problema en la rama release/hotfix',
+                '- [ ] Re-desplegar cuando este listo'
+              ].join('\n');
+              labels = ['deploy', 'fallo', 'intervencion-manual'];
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title, body, labels
+            });
+
+            console.log(`Issue creado: ${title}`);

@@ -1,0 +1,85 @@
+# ================================================================
+# .github/workflows/ci.yml
+# ================================================================
+# WORKFLOW 1 / 8
+#
+# RESPONSABILIDAD: CI pipeline — lint, tests, build check.
+# Gate obligatorio para merge via branch protection rules.
+#
+# TRIGGER:
+#   pull_request → develop, main-promocion-pro, main
+#
+# RUNNER: github-hosted
+# ================================================================
+
+name: "CI - Lint, Test, Build"
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main-promocion-pro
+      - main
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true    # Nuevo push a la PR cancela CI anterior
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  lint:
+    name: "Lint"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Ejecutar lint"
+        run: |
+          # ═══ REEMPLAZAR CON LINTER REAL ═══
+          echo "Ejecutando lint..."
+          # Ejemplos:
+          # npm run lint
+          # flake8 .
+          # golangci-lint run
+          # ════════════════════════════════
+          echo "Lint completado."
+
+  test:
+    name: "Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Ejecutar tests"
+        run: |
+          # ═══ REEMPLAZAR CON TESTS REALES ═══
+          echo "Ejecutando tests unitarios..."
+          # Ejemplos:
+          # npm test
+          # pytest
+          # go test ./...
+          # ═══════════════════════════════════
+          echo "Tests completados."
+
+  build-check:
+    name: "Build Check"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Verificar build"
+        run: |
+          # ═══ REEMPLAZAR CON BUILD REAL ═══
+          echo "Verificando que el build compila..."
+          # Ejemplos:
+          # npm run build
+          # docker build .
+          # go build ./...
+          # ═══════════════════════════════
+          echo "Build check completado."

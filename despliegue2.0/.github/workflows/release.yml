@@ -1,0 +1,316 @@
+# ================================================================
+# .github/workflows/release.yml
+# ================================================================
+# WORKFLOW 4 / 8
+#
+# RESPONSABILIDAD UNICA: Crear tag semantico y GitHub Release
+# tras merge de release/* o hotfix/* a main-promocion-pro.
+# Tambien crea PR automatica main-promocion-pro -> main.
+#
+# TRIGGER:
+#   pull_request [closed] → main-promocion-pro
+#
+# RUNNER: github-hosted
+#
+# COMUNICACION CON OTROS WORKFLOWS:
+#   → Crea tag vX.Y.Z en main-promocion-pro
+#   → Crea GitHub Release
+#   → Crea PR main-promocion-pro -> main (merge manual por el usuario tras deploy exitoso)
+#   → Crea deploy-schedule/vX.Y.Z.json en rama deploy-state
+#
+# SEGURIDAD:
+#   - Version extraida del nombre de rama (inmune a inyeccion)
+#   - Metadata extraida del body del PR via env: blocks
+#   - Sin interpolacion directa de ${{ }} en contexto shell
+#   - Schedule files en rama deploy-state (no contamina main)
+#
+# CAMBIOS VS 1-release.yml ORIGINAL:
+#   - Trigger: push:main → pull_request[closed]:main-promocion-pro
+#   - Version: commit message [major]/[minor] → nombre de rama release/vX.Y.Z
+#   - Metadata: commit message → body del PR
+#   - Estado: git push main → git push deploy-state
+#   - Nuevo: creacion automatica de PR a main
+#   - Seguridad: todas las interpolaciones via env: blocks
+# ================================================================
+
+name: "Release - Create Semantic Tag"
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main-promocion-pro
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create-release:
+    name: "Crear tag y release"
+    runs-on: ubuntu-latest
+
+    # Solo si:
+    # 1. El PR fue merged (no cerrado sin merge)
+    # 2. Viene de una rama release/* o hotfix/*
+    if: >
+      github.event.pull_request.merged == true &&
+      (startsWith(github.event.pull_request.head.ref, 'release/') ||
+       startsWith(github.event.pull_request.head.ref, 'hotfix/'))
+
+    steps:
+      # ─── Checkout con historial completo ──────────────────────
+      - name: "Checkout main-promocion-pro"
+        uses: actions/checkout@v4
+        with:
+          ref: main-promocion-pro
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ─── Extraer version del nombre de rama ───────────────────
+      # release/v2.4.0 → v2.4.0 | hotfix/v2.4.1 → v2.4.1
+      # SEGURO: el nombre de rama es controlado, no texto libre.
+      - name: "Extraer version del nombre de rama"
+        id: version
+        env:
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          VERSION=$(echo "${BRANCH}" | grep -oP 'v\d+\.\d+\.\d+' || echo "")
+
+          if [ -z "${VERSION}" ]; then
+            echo "ERROR: No se encontro version en: ${BRANCH}"
+            echo "Formato requerido: release/vX.Y.Z o hotfix/vX.Y.Z"
+            exit 1
+          fi
+
+          # Validar que es semver estricto
+          if ! echo "${VERSION}" | grep -qP '^v\d+\.\d+\.\d+$'; then
+            echo "ERROR: Version no es semver valido: ${VERSION}"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Version extraida: ${VERSION}"
+
+      # ─── Verificar que el tag no existe ───────────────────────
+      - name: "Verificar que el tag no existe"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if git rev-parse --verify "refs/tags/${VERSION}" > /dev/null 2>&1; then
+            echo "ERROR: Tag ${VERSION} ya existe en el repositorio"
+            exit 1
+          fi
+          echo "Tag ${VERSION} disponible."
+
+      # ─── Obtener tag anterior (para CHANGELOG) ───────────────
+      - name: "Obtener tag anterior"
+        id: prev-tag
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "prev_tag=${PREV_TAG}" >> $GITHUB_OUTPUT
+          echo "Tag anterior: ${PREV_TAG:-ninguno}"
+
+      # ─── Determinar tipo de cambio ───────────────────────────
+      - name: "Determinar tipo de cambio"
+        id: bump-type
+        env:
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          if echo "${BRANCH}" | grep -q '^hotfix/'; then
+            echo "type=hotfix" >> $GITHUB_OUTPUT
+          else
+            echo "type=release" >> $GITHUB_OUTPUT
+          fi
+
+      # ─── Generar notas de release ────────────────────────────
+      - name: "Generar notas de cambios"
+        id: changelog
+        env:
+          PREV_TAG: ${{ steps.prev-tag.outputs.prev_tag }}
+        run: |
+          if [ -n "${PREV_TAG}" ]; then
+            CHANGES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges || echo "")
+          else
+            CHANGES=$(git log --pretty=format:"- %s (%h)" --no-merges -20 || echo "")
+          fi
+
+          # Guardar en archivo para evitar problemas con caracteres especiales
+          echo "${CHANGES}" > /tmp/changelog.txt
+          echo "Cambios generados:"
+          echo "${CHANGES}"
+
+      # ─── Crear GitHub Release con tag anotado ────────────────
+      - name: "Crear GitHub Release"
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          target_commitish: main-promocion-pro
+          name: "Release ${{ steps.version.outputs.version }}"
+          body: |
+            ## Release ${{ steps.version.outputs.version }}
+
+            **Tipo de cambio:** ${{ steps.bump-type.outputs.type }}
+            **Rama origen:** ${{ github.event.pull_request.head.ref }}
+            **PR:** #${{ github.event.pull_request.number }}
+
+            ### Cambios incluidos
+
+            ${{ steps.changelog.outputs.changes }}
+
+            ---
+            *Tag creado en main-promocion-pro. Se mergeara a main tras verificacion en produccion.*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+
+      # ─── Crear PR automatica: main-promocion-pro → main ──────
+      # Cuando el health check pase, deploy-production.yml marcara
+      # esta PR como lista. El usuario la mergea manualmente.
+      - name: "Crear PR a main"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Verificar si ya existe una PR abierta
+          EXISTING_PR=$(gh pr list \
+            --base main \
+            --head main-promocion-pro \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -n "${EXISTING_PR}" ]; then
+            echo "PR abierta existente: #${EXISTING_PR}. Actualizando titulo..."
+            gh pr edit "${EXISTING_PR}" \
+              --title "release: merge ${VERSION} a main tras verificacion en produccion"
+            echo "PR #${EXISTING_PR} actualizada."
+          else
+            echo "Creando nueva PR main-promocion-pro -> main..."
+            gh pr create \
+              --base main \
+              --head main-promocion-pro \
+              --title "release: merge ${VERSION} a main tras verificacion en produccion" \
+              --body "## Merge manual tras verificacion en produccion
+
+          Cuando el deploy a produccion sea exitoso y el health check pase,
+          **deploy-production.yml** marcara esta PR como lista para merge
+          y agregara un comentario confirmandolo.
+
+          **Mergear esta PR manualmente** una vez verificado el deploy.
+
+          **Tag:** ${VERSION}
+          **Tipo:** ${{ steps.bump-type.outputs.type }}
+          **PR origen:** #${{ github.event.pull_request.number }}"
+            echo "PR creada."
+          fi
+
+      # ─── Extraer metadata de deploy del body del PR ──────────
+      # SEGURO: leemos del body del PR via env:, no del commit message.
+      # El developer incluye en el body del PR:
+      #   DEPLOY_SCHEDULED: 2026-02-10T22:00:00+01:00
+      #   TYPEAPP: frontend | backend | both
+      - name: "Extraer fecha de deploy"
+        id: extract-date
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          SCHEDULED_DATE=$(echo "${PR_BODY}" | grep -oP 'DEPLOY_SCHEDULED:\s*\K[^\s]+' || echo "")
+
+          if [ -z "${SCHEDULED_DATE}" ]; then
+            echo "INFO: No se encontro DEPLOY_SCHEDULED en el body del PR."
+            echo "El deploy debera dispararse manualmente via workflow_dispatch."
+            echo "has_schedule=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Validar formato ISO 8601
+          if ! date --date="${SCHEDULED_DATE}" +%s > /dev/null 2>&1; then
+            echo "ERROR: Fecha invalida: ${SCHEDULED_DATE}"
+            echo "Formato requerido: YYYY-MM-DDTHH:MM:SS+HH:MM"
+            exit 1
+          fi
+
+          EPOCH=$(date --date="${SCHEDULED_DATE}" +%s)
+          echo "scheduled_date=${SCHEDULED_DATE}" >> $GITHUB_OUTPUT
+          echo "scheduled_epoch=${EPOCH}" >> $GITHUB_OUTPUT
+          echo "has_schedule=true" >> $GITHUB_OUTPUT
+          echo "Deploy programado: ${SCHEDULED_DATE} (epoch: ${EPOCH})"
+
+      - name: "Extraer tipo de aplicacion"
+        id: extract-typeapp
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          TYPEAPP=$(echo "${PR_BODY}" | grep -oP 'TYPEAPP:\s*\K[^\s]+' || echo "both")
+
+          if [[ ! "${TYPEAPP}" =~ ^(frontend|backend|both)$ ]]; then
+            echo "WARN: TYPEAPP invalido '${TYPEAPP}', usando default: both"
+            TYPEAPP="both"
+          fi
+
+          echo "typeapp=${TYPEAPP}" >> $GITHUB_OUTPUT
+          echo "Tipo de aplicacion: ${TYPEAPP}"
+
+      # ─── Crear schedule en rama deploy-state ─────────────────
+      # Los archivos de schedule se almacenan en una rama orphan
+      # dedicada (deploy-state) para no contaminar main con
+      # commits de estado.
+      - name: "Crear schedule en deploy-state"
+        if: steps.extract-date.outputs.has_schedule == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SCHEDULED_DATE: ${{ steps.extract-date.outputs.scheduled_date }}
+          SCHEDULED_EPOCH: ${{ steps.extract-date.outputs.scheduled_epoch }}
+          TYPEAPP: ${{ steps.extract-typeapp.outputs.typeapp }}
+        run: |
+          # Cambiar a rama deploy-state
+          git fetch origin deploy-state 2>/dev/null || true
+
+          if git rev-parse --verify origin/deploy-state > /dev/null 2>&1; then
+            git checkout deploy-state
+          else
+            echo "Rama deploy-state no existe. Creando como orphan..."
+            git checkout --orphan deploy-state
+            git rm -rf . 2>/dev/null || true
+            echo "# Deploy State - rama de estado para schedules" > README.md
+            git add README.md
+          fi
+
+          mkdir -p deploy-schedule
+
+          python3 << 'PYEOF'
+          import json, os
+          from datetime import datetime, timezone
+
+          data = {
+              "tag": os.environ["VERSION"],
+              "typeapp": os.environ["TYPEAPP"],
+              "scheduled_date_original": os.environ["SCHEDULED_DATE"],
+              "scheduled_epoch_utc": int(os.environ["SCHEDULED_EPOCH"]),
+              "status": "pending",
+              "created_at": datetime.now(timezone.utc).isoformat()
+          }
+
+          filepath = f"deploy-schedule/{os.environ['VERSION']}.json"
+          with open(filepath, "w") as f:
+              json.dump(data, f, indent=2)
+
+          print(f"Schedule creado: {filepath}")
+          print(json.dumps(data, indent=2))
+          PYEOF
+
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "GitHub Actions Bot"
+          git add deploy-schedule/
+          git commit -m "schedule: ${VERSION} at ${SCHEDULED_DATE}"
+
+          # Push con retry para evitar conflictos
+          for i in 1 2 3; do
+            git push origin deploy-state && break
+            echo "Push fallo (intento $i/3). Reintentando..."
+            git pull --rebase origin deploy-state
+            sleep 2
+          done

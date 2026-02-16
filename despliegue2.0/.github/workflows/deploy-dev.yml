@@ -1,0 +1,67 @@
+# ================================================================
+# .github/workflows/deploy-dev.yml
+# ================================================================
+# WORKFLOW 2 / 8
+#
+# RESPONSABILIDAD: Deploy automatico a entorno de desarrollo.
+# Se ejecuta en cada push a develop.
+#
+# TRIGGER:
+#   push → develop
+#
+# RUNNER: github-hosted (o self-hosted si dev es on-premise)
+# ================================================================
+
+name: "Deploy - Development"
+
+on:
+  push:
+    branches:
+      - develop
+
+concurrency:
+  group: deploy-development
+  cancel-in-progress: true    # En dev, ultimo push gana
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  deploy:
+    name: "Deploy a desarrollo"
+    runs-on: ubuntu-latest    # Cambiar a self-hosted si el entorno dev es on-premise
+    environment: development
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Build para desarrollo"
+        run: |
+          # ═══ REEMPLAZAR CON BUILD REAL ═══
+          echo "Building para desarrollo..."
+          # Ejemplos:
+          # npm ci && npm run build
+          # docker build -t app:dev .
+          # ═══════════════════════════════
+          echo "Build completado."
+
+      - name: "Deploy a entorno de desarrollo"
+        run: |
+          # ═══ REEMPLAZAR CON DEPLOY REAL ═══
+          echo "Desplegando a desarrollo..."
+          # Ejemplos:
+          # docker-compose -f docker-compose.dev.yml up -d
+          # kubectl apply -f k8s/dev/
+          # ════════════════════════════════════
+          echo "Deploy a desarrollo completado."
+
+      - name: "Smoke test basico"
+        run: |
+          # ═══ REEMPLAZAR CON SMOKE TEST REAL ═══
+          echo "Ejecutando smoke test..."
+          # Ejemplo:
+          # curl -sf http://dev.example.com/health || exit 1
+          # ═══════════════════════════════════════
+          echo "Smoke test completado."
