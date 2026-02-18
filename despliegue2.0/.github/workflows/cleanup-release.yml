@@ -1,0 +1,244 @@
+# ================================================================
+# .github/workflows/cleanup-release.yml
+# ================================================================
+# WORKFLOW 9 / 9
+#
+# RESPONSABILIDAD UNICA: Limpiar una release erronea.
+# Borra tag, GitHub Release, JSON de schedule y cierra la PR a main.
+#
+# TRIGGER:
+#   workflow_dispatch → manual
+#
+# RUNNER: github-hosted
+#
+# QUE LIMPIA:
+#   1. Tag git (remoto)
+#   2. GitHub Release asociada al tag
+#   3. JSON de schedule en rama deploy-state
+#   4. PR abierta de main-promocion-pro -> main (si existe)
+#
+# SEGURIDAD:
+#   - Requiere confirmacion textual del tag
+#   - Solo limpia si el tag NO esta desplegado en produccion
+#   - Todos los inputs via env: blocks y process.env
+#   - No toca main ni main-promocion-pro (solo metadata)
+# ================================================================
+
+name: "Cleanup - Remove Erroneous Release"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag a eliminar (ej: v2.4.0)'
+        required: true
+        type: string
+      confirm_tag:
+        description: 'Escribe el tag otra vez para confirmar'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  deployments: read
+
+jobs:
+  cleanup:
+    name: "Limpiar release erronea"
+    runs-on: ubuntu-latest
+
+    steps:
+      # ─── Validar confirmacion ────────────────────────────────
+      - name: "Validar confirmacion"
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+          CONFIRM: ${{ github.event.inputs.confirm_tag }}
+        run: |
+          if [ "${TAG}" != "${CONFIRM}" ]; then
+            echo "ERROR: Los tags no coinciden."
+            echo "  Tag:     '${TAG}'"
+            echo "  Confirm: '${CONFIRM}'"
+            echo "Abortando por seguridad."
+            exit 1
+          fi
+
+          if ! echo "${TAG}" | grep -qP '^v\d+\.\d+\.\d+$'; then
+            echo "ERROR: Formato invalido: '${TAG}'"
+            echo "Formato requerido: vX.Y.Z (ejemplo: v2.4.0)"
+            exit 1
+          fi
+
+          echo "Confirmacion valida: ${TAG}"
+
+      # ─── Checkout ────────────────────────────────────────────
+      - name: "Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ─── Verificar que NO esta desplegado en produccion ──────
+      - name: "Verificar que no esta en produccion"
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag = process.env.TAG;
+
+            const deployments = await github.rest.repos.listDeployments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              environment: 'production',
+              per_page: 1
+            });
+
+            if (deployments.data.length > 0) {
+              const latest = deployments.data[0];
+
+              // Obtener estado del deployment
+              const statuses = await github.rest.repos.listDeploymentStatuses({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                deployment_id: latest.id,
+                per_page: 1
+              });
+
+              const lastStatus = statuses.data.length > 0 ? statuses.data[0].state : 'unknown';
+
+              if (latest.ref === tag && lastStatus === 'success') {
+                core.setFailed(
+                  `BLOQUEADO: ${tag} esta actualmente desplegado en produccion con estado '${lastStatus}'.\n` +
+                  `No se puede limpiar un tag en produccion. Usa rollback primero.`
+                );
+                return;
+              }
+            }
+
+            console.log(`${tag} NO esta desplegado en produccion. Limpieza segura.`);
+
+      # ─── 1. Borrar GitHub Release ────────────────────────────
+      - name: "Borrar GitHub Release"
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag = process.env.TAG;
+
+            try {
+              const release = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: tag
+              });
+
+              await github.rest.repos.deleteRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: release.data.id
+              });
+
+              console.log(`GitHub Release '${tag}' eliminada.`);
+            } catch (e) {
+              if (e.status === 404) {
+                console.log(`No se encontro GitHub Release para '${tag}'. Saltando.`);
+              } else {
+                throw e;
+              }
+            }
+
+      # ─── 2. Borrar tag remoto ────────────────────────────────
+      - name: "Borrar tag remoto"
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if git rev-parse --verify "refs/tags/${TAG}" > /dev/null 2>&1; then
+            git push origin --delete "${TAG}"
+            echo "Tag '${TAG}' eliminado del remoto."
+          else
+            echo "Tag '${TAG}' no existe en el repositorio. Saltando."
+          fi
+
+      # ─── 3. Borrar JSON de schedule en deploy-state ──────────
+      - name: "Borrar schedule de deploy-state"
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          git fetch origin deploy-state 2>/dev/null || true
+
+          if ! git rev-parse --verify origin/deploy-state > /dev/null 2>&1; then
+            echo "Rama deploy-state no existe. Saltando."
+            exit 0
+          fi
+
+          git checkout deploy-state
+
+          SCHEDULE_FILE="deploy-schedule/${TAG}.json"
+
+          if [ -f "${SCHEDULE_FILE}" ]; then
+            rm "${SCHEDULE_FILE}"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git config user.name "GitHub Actions Bot"
+            git add -A
+            git commit -m "cleanup: removed schedule for ${TAG}"
+
+            for i in 1 2 3; do
+              git push origin deploy-state && break
+              echo "Push fallo (intento $i/3). Reintentando..."
+              git pull --rebase origin deploy-state
+              sleep 2
+            done
+
+            echo "Schedule '${SCHEDULE_FILE}' eliminado."
+          else
+            echo "No existe schedule para '${TAG}'. Saltando."
+          fi
+
+      # ─── 4. Cerrar PR a main si existe ──────────────────────
+      - name: "Cerrar PR a main"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          PR_NUMBER=$(gh pr list \
+            --base main \
+            --head main-promocion-pro \
+            --state open \
+            --json number,title \
+            --jq ".[] | select(.title | contains(\"${TAG}\")) | .number")
+
+          if [ -n "${PR_NUMBER}" ]; then
+            gh pr close "${PR_NUMBER}" \
+              --comment "Cerrada automaticamente por cleanup de release erronea: ${TAG}"
+            echo "PR #${PR_NUMBER} cerrada."
+          else
+            echo "No hay PR abierta asociada a '${TAG}'. Saltando."
+          fi
+
+      # ─── Resumen ─────────────────────────────────────────────
+      - name: "Resumen de limpieza"
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "============================================"
+          echo "  LIMPIEZA COMPLETADA"
+          echo "============================================"
+          echo "  Tag:        ${TAG}"
+          echo "  Ejecutado:  ${ACTOR}"
+          echo ""
+          echo "  Elementos limpiados:"
+          echo "    - GitHub Release"
+          echo "    - Tag remoto"
+          echo "    - JSON de schedule (deploy-state)"
+          echo "    - PR a main (si existia)"
+          echo ""
+          echo "  Para re-crear la release:"
+          echo "    1. Corregir el codigo en la rama release/hotfix"
+          echo "    2. Crear nueva PR a main-promocion-pro"
+          echo "    3. release.yml creara el tag y release nuevos"
+          echo "============================================"
